@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Joy, JoyFeedback
-from std_msgs.msg import Float64MultiArray, Float32
+from std_msgs.msg import Float64MultiArray
 
 
 class StickAxisLock:
@@ -142,8 +142,8 @@ class PS5Mapper(Node):
 
         # Gripper force & angle feedback subscription
         self.grip_feedback_subscription = self.create_subscription(
-            Float32Array,
-            'gripper_feedback',
+            Float64MultiArray,
+            'gripper_state',
             self.grip_feedback_callback,
             10
         )
@@ -383,22 +383,22 @@ class PS5Mapper(Node):
                 f"Joy input timed out ({elapsed_sec:.2f}s > {timeout}s). Arm stopped."
             )
 
-    def grip_feedback_callback(self, msg: Float32):
+    def grip_feedback_callback(self, msg: Float64MultiArray):
         """Receives gripper feedback and publishes haptic rumble commands to DualSense."""
-        self.get_logger().info(f"Gripper Feedback: {msg.data:.3f}")
-
+        self.get_logger().info(f"Gripper Feedback: {"Gripping" if msg.data[1] else "Not Gripping"}")
+        
         # Left Motor (heavy low-frequency rumble)
         left_msg = JoyFeedback()
         left_msg.type = JoyFeedback.TYPE_RUMBLE
         left_msg.id = 0
-        left_msg.intensity = msg.data
+        left_msg.intensity = msg.data[1]
         self.feedback_publisher.publish(left_msg)
 
         # Right Motor (light high-frequency buzz)
         right_msg = JoyFeedback()
         right_msg.type = JoyFeedback.TYPE_RUMBLE
         right_msg.id = 1
-        right_msg.intensity = msg.data
+        right_msg.intensity = msg.data[1]
         self.feedback_publisher.publish(right_msg)
 
 
