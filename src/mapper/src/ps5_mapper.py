@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import math
 import rclpy
 from rclpy.node import Node
+from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy, JoyFeedback
 from std_msgs.msg import Float64MultiArray
 
@@ -41,26 +43,29 @@ class StickAxisLock:
 
 class PS5Mapper(Node):
     """
-    ROS 2 teleoperation node for PS5 DualSense controller mapping to /arm_cmd (target joint positions)
-    and /joy/set_feedback (haptics).
+    ROS 2 teleoperation node for PS5 DualSense controller mapping to /arm_cmd (joint commands),
+    /arm_target_pose (Cartesian end-effector target for IK), and /joy/set_feedback (haptics).
 
     Features:
-      - Deterministic 50 Hz Position Integration Loop (publishes continuous target angles in radians)
-      - Software Joint Limits clamping (prevents command windup past mechanical boundaries)
-      - Dominant-Axis Locking (eliminates diagonal joystick slip-up)
-      - Gripper Position Integration on D-Pad Left/Right (Left = Open, Right = Close)
-      - Gripper Max Speed Trimming on D-Pad Up/Down (+/-)
-      - Live Arm Joint Max Speed Trimming via Shape Buttons + Triggers:
-          * CROSS (Hold)    + RT/LT -> Base Yaw Max Speed (+/-)
-          * SQUARE (Hold)   + RT/LT -> Shoulder Pitch Max Speed (+/-)
-          * CIRCLE (Hold)   + RT/LT -> Elbow Pitch Max Speed (+/-)
-          * TRIANGLE (Hold) + RT/LT -> Wrist Max Speed (+/-)
-          * Tap for single step (±0.02 rad/s) or hold for smooth auto-repeat ramping.
-          * Arm motion locked during speed tuning for safety (gripper remains active).
-      - Layered Macro / Wrist Control (Right Bumper RB toggles Right Stick to Wrist Gimbal)
-      - Precision Crawl Mode (Left Bumper LB scales speed to 30%)
-      - Software Emergency Stop Lock (PS Button toggles latched halt, holds target positions)
-      - Signal Loss Watchdog Timer (holds target positions on disconnect / >0.2s timeout)
+      - Dual Mode Teleoperation (toggled via OPTIONS button):
+          * Mode 0 (FK): Joint-by-joint angle control on /arm_cmd.
+          * Mode 1 (IK): Cylindrical Cartesian end-effector control (TCP at gripper tip) on /arm_target_pose.
+      - World-Space Auto-Leveling for 4-Bevel Differential Wrist:
+          * Automatically counter-rotates wrist pitch to maintain gripper parallel to ground (or chosen pitch).
+          * Wrist Roll spins purely around the gripper approach vector.
+      - Deterministic 50 Hz Position Integration Loop.
+      - Dominant-Axis Locking (eliminates diagonal joystick slip-up).
+      - Gripper Position Integration on D-Pad Left/Right (Left = Open, Right = Close) in unified /arm_cmd array.
+      - Gripper Max Speed Trimming on D-Pad Up/Down (+/-).
+      - Live Arm / Cartesian Speed Trimming via Shape Buttons + Triggers:
+          * CROSS (Hold)    + RT/LT -> Base Yaw / Azimuth Max Speed (+/-)
+          * SQUARE (Hold)   + RT/LT -> Shoulder Pitch / Reach Max Speed (+/-)
+          * CIRCLE (Hold)   + RT/LT -> Elbow Pitch / Elevation Max Speed (+/-)
+          * TRIANGLE (Hold) + RT/LT -> Wrist Pitch & Roll Max Speed (+/-)
+      - Layered Orientation Control (Right Bumper RB toggles Right Stick to Wrist / World Pitch & Roll).
+      - Precision Crawl Mode (Left Bumper LB scales speeds to 30%).
+      - Software Emergency Stop Lock (PS Button toggles latched halt).
+      - Signal Loss Watchdog Timer (holds target positions on disconnect / >0.2s timeout).
     """
 
     MODE = 0  # 0: FK, 1: IK
@@ -76,17 +81,17 @@ class PS5Mapper(Node):
     DPAD_Y = 7
 
     # Button indices for PS5 controller on /joy (Linux evdev / joy_node mapping)
-    CROSS    = 0  # Bottom (Base Yaw)
-    CIRCLE   = 1  # Right  (Elbow Pitch)
-    TRIANGLE = 2  # Top    (Wrist)
-    SQUARE   = 3  # Left   (Shoulder Pitch)
-    LB       = 4
-    RB       = 5
+    CROSS    = 0  # Bottom (Base Yaw / Azimuth)
+    CIRCLE   = 1  # Right  (Elbow Pitch / Elevation)
+    TRIANGLE = 2  # Top    (Wrist / World Pitch & Roll)
+    SQUARE   = 3  # Left   (Shoulder Pitch / Reach)
+    LB       = 4  # Precision Crawl (30%)
+    RB       = 5  # Layer Toggle (Wrist Gimbal / World Orientation)
     LT_BTN   = 6
     RT_BTN   = 7
     SHARE    = 8
-    OPTIONS  = 9
-    PS_BTN   = 10
+    OPTIONS  = 9  # Mode Toggle (FK <-> IK)
+    PS_BTN   = 10 # Emergency Stop Lock Latch
     LJOY_BTN = 11
     RJOY_BTN = 12
 
@@ -106,9 +111,44 @@ class PS5Mapper(Node):
         (-0.35,  1.57),   # 5: Gripper
     ]
 
+    # Cartesian workspace limits (min, max) in meters / radians
+    REACH_LIMITS       = (0.05, 0.60)   # Radial reach (m) from base to TCP
+    ELEV_LIMITS        = (-0.30, 0.60)  # Elevation (m) from base to TCP
+    AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°)
+    WORLD_PITCH_LIMITS = (-1.57, 1.57)  # World pitch (rad) relative to horizon (0=horizontal)
+    ROLL_LIMITS        = (-3.14, 3.14)  # Wrist axial roll (rad) (±180°)
+
+    # Initial Cartesian home state (r, theta, z, world_pitch, roll)
+    HOME_CARTESIAN = {
+        'r': 0.25,
+        'theta': 0.0,
+        'z': 0.15,
+        'world_pitch': 0.0,
+        'roll': 0.0
+    }
+
     # Control loop rate
     CONTROL_RATE = 50.0   # Hz
     DT = 1.0 / CONTROL_RATE
+
+    @staticmethod
+    def euler_to_quaternion(yaw: float, pitch: float, roll: float) -> tuple[float, float, float, float]:
+        """
+        Converts Euler angles (yaw=Z, pitch=Y, roll=X) to a quaternion tuple (x, y, z, w).
+        Uses Z-Y-X intrinsic sequence (yaw -> pitch -> roll).
+        """
+        cy = math.cos(yaw * 0.5)
+        sy = math.sin(yaw * 0.5)
+        cp = math.cos(pitch * 0.5)
+        sp = math.sin(pitch * 0.5)
+        cr = math.cos(roll * 0.5)
+        sr = math.sin(roll * 0.5)
+
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+        return qx, qy, qz, qw
 
     def __init__(self):
         super().__init__('ps5_mapper')
@@ -134,13 +174,19 @@ class PS5Mapper(Node):
         self.declare_parameter('watchdog_timeout', 0.2)     # Duration before signal-lost flag
         self.declare_parameter('watchdog_rate', 10.0)       # Watchdog check frequency (Hz)
 
-        # Configurable through controller AND ROS2 CLI
+        # Configurable joint speeds (FK Mode)
         self.declare_parameter('max_base_speed', 0.1)       # Base Yaw max speed                (rad/s)
         self.declare_parameter('max_shoulder_speed', 0.1)   # Shoulder Pitch max speed          (rad/s)
         self.declare_parameter('max_elbow_speed', 0.1)      # Elbow Pitch max speed             (rad/s)
         self.declare_parameter('max_wrist_speed', 0.1)      # Wrist Pitch/Roll max speed        (rad/s)
         self.declare_parameter('max_gripper_speed', 0.1)    # Gripper max speed                 (rad/s)
 
+        # Configurable Cartesian speeds (IK Mode)
+        self.declare_parameter('max_reach_speed', 0.10)       # Radial reach max speed          (m/s)
+        self.declare_parameter('max_elev_speed', 0.10)        # Vertical elevation max speed    (m/s)
+        self.declare_parameter('max_azimuth_speed', 0.20)     # Base azimuth max speed          (rad/s)
+        self.declare_parameter('max_world_pitch_speed', 0.20) # World pitch max speed           (rad/s)
+        self.declare_parameter('max_roll_speed', 0.30)        # Wrist roll max speed            (rad/s)
 
         # Dynamic runtime joint max speed values
         self.max_base_speed = self.get_parameter('max_base_speed').value
@@ -149,8 +195,22 @@ class PS5Mapper(Node):
         self.max_wrist_speed = self.get_parameter('max_wrist_speed').value
         self.max_gripper_speed = self.get_parameter('max_gripper_speed').value
 
-        # ----- Target Position State -----
+        # Dynamic runtime Cartesian max speed values
+        self.max_reach_speed = self.get_parameter('max_reach_speed').value
+        self.max_elev_speed = self.get_parameter('max_elev_speed').value
+        self.max_azimuth_speed = self.get_parameter('max_azimuth_speed').value
+        self.max_world_pitch_speed = self.get_parameter('max_world_pitch_speed').value
+        self.max_roll_speed = self.get_parameter('max_roll_speed').value
+
+        # ----- Target Joint Position State (FK & Gripper) -----
         self.target_positions = list(self.HOME_POSITIONS)
+
+        # ----- Target Cartesian State (IK Mode) -----
+        self.target_r = self.HOME_CARTESIAN['r']
+        self.target_theta = self.HOME_CARTESIAN['theta']
+        self.target_z = self.HOME_CARTESIAN['z']
+        self.target_world_pitch = self.HOME_CARTESIAN['world_pitch']
+        self.target_roll = self.HOME_CARTESIAN['roll']
 
         # ----- Shared Input State (written by joy_callback, read by control_loop) -----
         self.lx = 0.0               # Left stick X (filtered)
@@ -190,6 +250,11 @@ class PS5Mapper(Node):
             Float64MultiArray, 'arm_cmd', 10
         )
 
+        # IK Cartesian target pose publisher for MoveIt / custom IK solver
+        self.target_pose_pub = self.create_publisher(
+            PoseStamped, 'arm_target_pose', 10
+        )
+
         self.feedback_publisher = self.create_publisher(
             JoyFeedback, '/joy/set_feedback', 10
         )
@@ -203,7 +268,7 @@ class PS5Mapper(Node):
         # Control loop (50 Hz)
         self.control_timer = self.create_timer(self.DT, self.control_loop)
 
-        self.get_logger().info("PS5 Mapper Node started (Position Control Mode).")
+        self.get_logger().info("PS5 Mapper Node started (Dual Mode: FK & IK Cartesian Control).")
 
     def apply_deadzone(self, value: float, threshold: float = None) -> float:
         """Applies a standard deadzone filter to an axis value."""
@@ -222,27 +287,44 @@ class PS5Mapper(Node):
             return 0.0
         return min(1.0, normalized)
 
-    def _apply_speed_delta(self, joint_name: str, delta: float, min_s: float, max_s: float):
-        """Increments or decrements joint max speed within safe bounds and logs the update."""
-        if joint_name == "Base Yaw":
-            self.max_base_speed = max(min_s, min(max_s, round(self.max_base_speed + delta, 3)))
-            new_val = self.max_base_speed
-        elif joint_name == "Shoulder Pitch":
-            self.max_shoulder_speed = max(min_s, min(max_s, round(self.max_shoulder_speed + delta, 3)))
-            new_val = self.max_shoulder_speed
-        elif joint_name == "Elbow Pitch":
-            self.max_elbow_speed = max(min_s, min(max_s, round(self.max_elbow_speed + delta, 3)))
-            new_val = self.max_elbow_speed
-        elif joint_name == "Wrist":
-            self.max_wrist_speed = max(min_s, min(max_s, round(self.max_wrist_speed + delta, 3)))
-            new_val = self.max_wrist_speed
-        elif joint_name == "Gripper":
+    def _apply_speed_delta(self, axis_name: str, delta: float, min_s: float, max_s: float):
+        """Increments or decrements joint / Cartesian max speed within safe bounds and logs update."""
+        if axis_name in ("Base Yaw", "Azimuth"):
+            if self.MODE == 0:
+                self.max_base_speed = max(min_s, min(max_s, round(self.max_base_speed + delta, 3)))
+                val, unit = self.max_base_speed, "rad/s"
+            else:
+                self.max_azimuth_speed = max(min_s, min(max_s, round(self.max_azimuth_speed + delta, 3)))
+                val, unit = self.max_azimuth_speed, "rad/s"
+        elif axis_name in ("Shoulder Pitch", "Reach"):
+            if self.MODE == 0:
+                self.max_shoulder_speed = max(min_s, min(max_s, round(self.max_shoulder_speed + delta, 3)))
+                val, unit = self.max_shoulder_speed, "rad/s"
+            else:
+                self.max_reach_speed = max(0.01, min(0.50, round(self.max_reach_speed + (delta * 0.5), 3)))
+                val, unit = self.max_reach_speed, "m/s"
+        elif axis_name in ("Elbow Pitch", "Elevation"):
+            if self.MODE == 0:
+                self.max_elbow_speed = max(min_s, min(max_s, round(self.max_elbow_speed + delta, 3)))
+                val, unit = self.max_elbow_speed, "rad/s"
+            else:
+                self.max_elev_speed = max(0.01, min(0.50, round(self.max_elev_speed + (delta * 0.5), 3)))
+                val, unit = self.max_elev_speed, "m/s"
+        elif axis_name in ("Wrist", "Pitch & Roll"):
+            if self.MODE == 0:
+                self.max_wrist_speed = max(min_s, min(max_s, round(self.max_wrist_speed + delta, 3)))
+                val, unit = self.max_wrist_speed, "rad/s"
+            else:
+                self.max_world_pitch_speed = max(min_s, min(max_s, round(self.max_world_pitch_speed + delta, 3)))
+                self.max_roll_speed = max(min_s, min(max_s, round(self.max_roll_speed + delta, 3)))
+                val, unit = self.max_world_pitch_speed, "rad/s"
+        elif axis_name == "Gripper":
             self.max_gripper_speed = max(min_s, min(max_s, round(self.max_gripper_speed + delta, 3)))
-            new_val = self.max_gripper_speed
+            val, unit = self.max_gripper_speed, "rad/s"
         else:
             return
 
-        self.get_logger().info(f"[SPEED TRIM] {joint_name} max speed: {new_val:.2f} rad/s")
+        self.get_logger().info(f"[SPEED TRIM] {axis_name} max speed: {val:.2f} {unit}")
 
     def check_estop_btn(self, new_state: int):
         if new_state == 1 and self.prev_estop_btn_state == 0:
@@ -257,9 +339,12 @@ class PS5Mapper(Node):
         if new_state == 1 and self.prev_mode_btn_state == 0:
             self.MODE = 1 - self.MODE
             if self.MODE == 1:
-                self.get_logger().warn("Switched to IK mode (IK Cartesian mappings pending configuration).")
+                # NOTE: Initial implementation assumes ideal robot tracking. In the future,
+                # we can synchronize self.target_r, self.target_theta, etc., with /joint_states feedback.
+                self.get_logger().info("Switched to IK Mode (Cartesian target pose published to /arm_target_pose).")
             else:
-                self.get_logger().info("Switched to FK mode.")
+                # NOTE: In the future, synchronize self.target_positions with /joint_states feedback when switching back.
+                self.get_logger().info("Switched to FK Mode (Joint positions published to /arm_cmd).")
         self.prev_mode_btn_state = new_state
 
     def joy_callback(self, msg: Joy):
@@ -311,7 +396,7 @@ class PS5Mapper(Node):
         self.prev_dpad_up = dpad_up
         self.prev_dpad_down = dpad_down
 
-        # 5. Joint Speed Trimming (Shape Buttons + Triggers)
+        # 5. Speed Trimming (Shape Buttons + Triggers)
         cross_held = bool(msg.buttons[self.CROSS])
         square_held = bool(msg.buttons[self.SQUARE])
         circle_held = bool(msg.buttons[self.CIRCLE])
@@ -320,14 +405,24 @@ class PS5Mapper(Node):
         self.is_tuning_speed = cross_held or square_held or circle_held or triangle_held
 
         if self.is_tuning_speed:
-            if cross_held:
-                selected_joint = "Base Yaw"
-            elif square_held:
-                selected_joint = "Shoulder Pitch"
-            elif circle_held:
-                selected_joint = "Elbow Pitch"
+            if self.MODE == 0:
+                if cross_held:
+                    selected_axis = "Base Yaw"
+                elif square_held:
+                    selected_axis = "Shoulder Pitch"
+                elif circle_held:
+                    selected_axis = "Elbow Pitch"
+                else:
+                    selected_axis = "Wrist"
             else:
-                selected_joint = "Wrist"
+                if cross_held:
+                    selected_axis = "Azimuth"
+                elif square_held:
+                    selected_axis = "Reach"
+                elif circle_held:
+                    selected_axis = "Elevation"
+                else:
+                    selected_axis = "Pitch & Roll"
 
             lt_val = self.get_trigger_value(msg.axes[self.LT])
             rt_val = self.get_trigger_value(msg.axes[self.RT])
@@ -345,11 +440,11 @@ class PS5Mapper(Node):
                 if is_new_press:
                     self.trim_held_start_time = now_sec
                     self.last_trim_time = now_sec
-                    self._apply_speed_delta(selected_joint, delta, min_s, max_s)
+                    self._apply_speed_delta(selected_axis, delta, min_s, max_s)
                 else:
                     if (now_sec - self.trim_held_start_time) > 0.4 and (now_sec - self.last_trim_time) > 0.15:
                         self.last_trim_time = now_sec
-                        self._apply_speed_delta(selected_joint, delta, min_s, max_s)
+                        self._apply_speed_delta(selected_axis, delta, min_s, max_s)
 
             self.prev_rt_active = rt_active
             self.prev_lt_active = lt_active
@@ -374,7 +469,7 @@ class PS5Mapper(Node):
         self.ry = self.apply_deadzone(msg.axes[self.RJOY_Y], deadzone)
 
     def control_loop(self):
-        """50 Hz control loop: integrates stick inputs into target positions and publishes."""
+        """50 Hz control loop: integrates inputs into FK / IK target poses and publishes."""
         dt = self.DT
         speed_mult = self.get_parameter('precision_scale').value if self.lb_held else 1.0
 
@@ -382,18 +477,63 @@ class PS5Mapper(Node):
         if not (self.e_stop_active or self.signal_lost):
 
             # Freeze arm increments during speed tuning, but allow gripper
-            if not self.is_tuning_speed and self.MODE == 0:  # FK Mode
-                if not self.rb_held:
-                    # Default Reach Mode: Right Stick Y controls Elbow
-                    self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
-                    self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
-                    self.target_positions[2] += self.ry * self.max_elbow_speed * speed_mult * dt     # Elbow Pitch
-                else:
-                    # Wrist Gimbal Mode (RB held): Right Stick controls Wrist Pitch (Y) & Roll (X)
-                    self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
-                    self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
-                    self.target_positions[3] += self.ry * self.max_wrist_speed * speed_mult * dt     # Wrist Pitch
-                    self.target_positions[4] += self.rx * self.max_wrist_speed * speed_mult * dt     # Wrist Roll
+            if not self.is_tuning_speed:
+                if self.MODE == 0:
+                    # --- FK Mode: Joint Position Integration ---
+                    if not self.rb_held:
+                        # Default Reach Mode: Right Stick Y controls Elbow
+                        self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
+                        self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
+                        self.target_positions[2] += self.ry * self.max_elbow_speed * speed_mult * dt     # Elbow Pitch
+                    else:
+                        # Wrist Gimbal Mode (RB held): Right Stick controls Wrist Pitch (Y) & Roll (X)
+                        self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
+                        self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
+                        self.target_positions[3] += self.ry * self.max_wrist_speed * speed_mult * dt     # Wrist Pitch
+                        self.target_positions[4] += self.rx * self.max_wrist_speed * speed_mult * dt     # Wrist Roll
+
+                elif self.MODE == 1:
+                    # --- IK Mode: Cylindrical Coordinates Integration ---
+                    # Left Stick: Base Azimuth (X) and Radial Reach (Y)
+                    self.target_theta += self.lx * self.max_azimuth_speed * speed_mult * dt
+                    self.target_r += self.ly * self.max_reach_speed * speed_mult * dt
+
+                    if not self.rb_held:
+                        # Translation Mode: Right Stick Y controls Vertical Elevation (Z)
+                        self.target_z += self.ry * self.max_elev_speed * speed_mult * dt
+                    else:
+                        # Orientation Layer (RB held): Right Stick controls World Pitch (Y) & Axial Roll (X)
+                        self.target_world_pitch += self.ry * self.max_world_pitch_speed * speed_mult * dt
+                        self.target_roll += self.rx * self.max_roll_speed * speed_mult * dt
+
+                    # Clamp Cartesian targets to workspace boundaries
+                    self.target_r = max(self.REACH_LIMITS[0], min(self.REACH_LIMITS[1], self.target_r))
+                    self.target_z = max(self.ELEV_LIMITS[0], min(self.ELEV_LIMITS[1], self.target_z))
+                    self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], self.target_theta))
+                    self.target_world_pitch = max(
+                        self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], self.target_world_pitch)
+                    )
+                    self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], self.target_roll))
+
+                    # Compute Cartesian Coordinates (TCP / Gripper tip relative to Base)
+                    pose_msg = PoseStamped()
+                    pose_msg.header.stamp = self.get_clock().now().to_msg()
+                    pose_msg.header.frame_id = 'base_link'
+                    pose_msg.pose.position.x = self.target_r * math.cos(self.target_theta)
+                    pose_msg.pose.position.y = self.target_r * math.sin(self.target_theta)
+                    pose_msg.pose.position.z = self.target_z
+
+                    # Compute Auto-Leveling Orientation Quaternion
+                    qx, qy, qz, qw = self.euler_to_quaternion(
+                        self.target_theta, self.target_world_pitch, self.target_roll
+                    )
+                    pose_msg.pose.orientation.x = qx
+                    pose_msg.pose.orientation.y = qy
+                    pose_msg.pose.orientation.z = qz
+                    pose_msg.pose.orientation.w = qw
+
+                    # Publish Cartesian Pose for IK Solver
+                    self.target_pose_pub.publish(pose_msg)
 
             # Gripper integration (always active, even during arm speed tuning)
             if self.dpad_x > 0.5:
@@ -405,7 +545,7 @@ class PS5Mapper(Node):
         for i, (lo, hi) in enumerate(self.JOINT_LIMITS):
             self.target_positions[i] = max(lo, min(hi, self.target_positions[i]))
 
-        # Publish target position commands
+        # Publish target position commands (unified 6-element array [J0..J4, Gripper])
         cmd_msg = Float64MultiArray()
         cmd_msg.data = list(self.target_positions)
         self.publisher.publish(cmd_msg)
