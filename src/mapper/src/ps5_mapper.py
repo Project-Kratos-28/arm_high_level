@@ -244,13 +244,17 @@ class PS5Mapper(Node):
             Float64MultiArray, 'gripper_state', self.grip_feedback_callback, 10
         )
 
-        # ----- Publishers -----
         # Arm position commands: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
         self.publisher = self.create_publisher(
             Float64MultiArray, 'arm_cmd', 10
         )
 
-        # IK Cartesian target pose publisher for MoveIt / custom IK solver
+        # IK target command array for IK Solver: [r, theta, z, world_pitch, roll, gripper]
+        self.ik_target_pub = self.create_publisher(
+            Float64MultiArray, 'arm_ik_cmd', 10
+        )
+
+        # IK Cartesian target pose publisher (for RViz / MoveIt visualization)
         self.target_pose_pub = self.create_publisher(
             PoseStamped, 'arm_target_pose', 10
         )
@@ -532,8 +536,20 @@ class PS5Mapper(Node):
                     pose_msg.pose.orientation.z = qz
                     pose_msg.pose.orientation.w = qw
 
-                    # Publish Cartesian Pose for IK Solver
+                    # Publish Cartesian Pose for visualization (RViz / MoveIt)
                     self.target_pose_pub.publish(pose_msg)
+
+                    # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
+                    ik_msg = Float64MultiArray()
+                    ik_msg.data = [
+                        float(self.target_r),
+                        float(self.target_theta),
+                        float(self.target_z),
+                        float(self.target_world_pitch),
+                        float(self.target_roll),
+                        float(self.target_positions[5])
+                    ]
+                    self.ik_target_pub.publish(ik_msg)
 
             # Gripper integration (always active, even during arm speed tuning)
             if self.dpad_x > 0.5:
@@ -545,10 +561,13 @@ class PS5Mapper(Node):
         for i, (lo, hi) in enumerate(self.JOINT_LIMITS):
             self.target_positions[i] = max(lo, min(hi, self.target_positions[i]))
 
-        # Publish target position commands (unified 6-element array [J0..J4, Gripper])
-        cmd_msg = Float64MultiArray()
-        cmd_msg.data = list(self.target_positions)
-        self.publisher.publish(cmd_msg)
+        # Mode-Gated Publishing:
+        # FK Mode: ps5_mapper directly publishes [J0..J4, Gripper] to /arm_cmd
+        # IK Mode: ps5_mapper published to /arm_ik_cmd above; the IK Solver will publish to /arm_cmd
+        if self.MODE == 0:
+            cmd_msg = Float64MultiArray()
+            cmd_msg.data = list(self.target_positions)
+            self.publisher.publish(cmd_msg)
 
     def watchdog_callback(self):
         """Monitors joystick heartbeat; sets signal_lost flag if communication drops."""
