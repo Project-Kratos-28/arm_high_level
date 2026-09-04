@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import math
+import numpy as np
+from scipy.spatial.transform import Rotation as R
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
@@ -44,27 +46,32 @@ class StickAxisLock:
 class PS5Mapper(Node):
     """
     ROS 2 teleoperation node for PS5 DualSense controller mapping to /arm_cmd (joint commands),
-    /arm_target_pose (Cartesian end-effector target for IK), and /joy/set_feedback (haptics).
+    /arm_ik_cmd (Cartesian targets for MoveIt TRAC-IK solver), /arm_target_pose (RViz visualization),
+    and /joy/set_feedback (DualSense haptic rumble).
 
     Features:
-      - Dual Mode Teleoperation (toggled via OPTIONS button):
-          * Mode 0 (FK): Joint-by-joint angle control on /arm_cmd.
-          * Mode 1 (IK): Cylindrical Cartesian end-effector control (TCP at gripper tip) on /arm_target_pose.
-      - World-Space Auto-Leveling for 4-Bevel Differential Wrist:
-          * Automatically counter-rotates wrist pitch to maintain gripper parallel to ground (or chosen pitch).
-          * Wrist Roll spins purely around the gripper approach vector.
+      - Dual-Mode Teleoperation (toggled via OPTIONS button):
+          * Mode 0 (FK): Joint-by-joint angle integration published directly to /arm_cmd.
+          * Mode 1 (IK): Cylindrical Cartesian end-effector control (TCP tool0) published to /arm_ik_cmd.
+      - Bumpless Bidirectional State Synchronization:
+          * FK -> IK: Analytical 3D Forward Kinematics (URDF-derived) initializes Cartesian targets
+            (r, theta, z, world_pitch, roll) directly from the current physical joint configuration.
+          * IK -> FK: Continuously mirrors solved joint angles from /arm_joint_sync while in IK mode,
+            allowing immediate and seamless resumption of joint-level control with zero jump.
+      - World-Space Auto-Leveling Orientation:
+          * Maintains gripper pitch relative to ground horizon across translations in IK mode.
+          * Right Bumper (RB) toggles the Right Stick to control World Pitch and Axial Wrist Roll.
       - Deterministic 50 Hz Position Integration Loop.
-      - Dominant-Axis Locking (eliminates diagonal joystick slip-up).
-      - Gripper Position Integration on D-Pad Left/Right (Left = Open, Right = Close) in unified /arm_cmd array.
+      - Dominant-Axis Locking (eliminates accidental diagonal stick cross-talk).
+      - Gripper Position Integration on D-Pad Left/Right (Left = Open, Right = Close).
       - Gripper Max Speed Trimming on D-Pad Up/Down (+/-).
-      - Live Arm / Cartesian Speed Trimming via Shape Buttons + Triggers:
-          * CROSS (Hold)    + RT/LT -> Base Yaw / Azimuth Max Speed (+/-)
-          * SQUARE (Hold)   + RT/LT -> Shoulder Pitch / Reach Max Speed (+/-)
-          * CIRCLE (Hold)   + RT/LT -> Elbow Pitch / Elevation Max Speed (+/-)
-          * TRIANGLE (Hold) + RT/LT -> Wrist Pitch & Roll Max Speed (+/-)
-      - Layered Orientation Control (Right Bumper RB toggles Right Stick to Wrist / World Pitch & Roll).
+      - Live Joint & Cartesian Speed Trimming via Shape Buttons + Triggers (LT/RT):
+          * CROSS (Hold)    + RT/LT -> Base Yaw (FK) / Azimuth (IK) Max Speed (+/-)
+          * SQUARE (Hold)   + RT/LT -> Shoulder Pitch (FK) / Reach (IK) Max Speed (+/-)
+          * CIRCLE (Hold)   + RT/LT -> Elbow Pitch (FK) / Elevation (IK) Max Speed (+/-)
+          * TRIANGLE (Hold) + RT/LT -> Wrist Pitch & Roll (FK/IK) Max Speed (+/-)
       - Precision Crawl Mode (Left Bumper LB scales speeds to 30%).
-      - Software Emergency Stop Lock (PS Button toggles latched halt).
+      - Software Emergency Stop Lock (PS Button toggles latched motion halt).
       - Signal Loss Watchdog Timer (holds target positions on disconnect / >0.2s timeout).
     """
 
@@ -80,7 +87,7 @@ class PS5Mapper(Node):
     DPAD_X = 6
     DPAD_Y = 7
 
-    # Button indices for PS5 controller on /joy (Linux evdev / joy_node mapping)
+    # Button indices for PS5 controller on /joy
     CROSS    = 0  # Bottom (Base Yaw / Azimuth)
     CIRCLE   = 1  # Right  (Elbow Pitch / Elevation)
     TRIANGLE = 2  # Top    (Wrist / World Pitch & Roll)
@@ -135,25 +142,6 @@ class PS5Mapper(Node):
     # Control loop rate
     CONTROL_RATE = 50.0   # Hz
     DT = 1.0 / CONTROL_RATE
-
-    @staticmethod
-    def euler_to_quaternion(yaw: float, pitch: float, roll: float) -> tuple[float, float, float, float]:
-        """
-        Converts Euler angles (yaw=Z, pitch=Y, roll=X) to a quaternion tuple (x, y, z, w).
-        Uses Z-Y-X intrinsic sequence (yaw -> pitch -> roll).
-        """
-        cy = math.cos(yaw * 0.5)
-        sy = math.sin(yaw * 0.5)
-        cp = math.cos(pitch * 0.5)
-        sp = math.sin(pitch * 0.5)
-        cr = math.cos(roll * 0.5)
-        sr = math.sin(roll * 0.5)
-
-        qw = cr * cp * cy + sr * sp * sy
-        qx = sr * cp * cy - cr * sp * sy
-        qy = cr * sp * cy + sr * cp * sy
-        qz = cr * cp * sy - sr * sp * cy
-        return qx, qy, qz, qw
 
     def __init__(self):
         super().__init__('ps5_mapper')
@@ -249,7 +237,10 @@ class PS5Mapper(Node):
             Float64MultiArray, 'gripper_state', self.grip_feedback_callback, 10
         )
 
-        # TODO: Subscribe to /joint_states for live arm feedback and bumpless mode handoff
+        # Subscriber for bumpless IK -> FK joint mirroring from ik_solver_node
+        self.joint_sync_sub = self.create_subscription(
+            Float64MultiArray, 'arm_joint_sync', self.joint_sync_callback, 10
+        )
 
         # Arm position commands: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
         self.publisher = self.create_publisher(
@@ -338,6 +329,10 @@ class PS5Mapper(Node):
         self.get_logger().info(f"[SPEED TRIM] {axis_name} max speed: {val:.2f} {unit}")
 
     def check_estop_btn(self, new_state: int):
+        """
+        Detects rising edge on the PS button to toggle the software Emergency Stop / Motion Lock.
+        When active, position increments in control_loop are frozen, holding current arm and gripper position.
+        """
         if new_state == 1 and self.prev_estop_btn_state == 0:
             self.e_stop_active = not self.e_stop_active
             if self.e_stop_active:
@@ -346,17 +341,44 @@ class PS5Mapper(Node):
                 self.get_logger().info("EMERGENCY STOP CLEARED. Normal operation resumed.")
         self.prev_estop_btn_state = new_state
 
+    def joint_sync_callback(self, msg: Float64MultiArray):
+        """
+        Callback for /arm_joint_sync topic published by ik_solver_node.
+        Continuously mirrors the latest solved joint angles into self.target_positions
+        while operating in IK mode (MODE == 1) to enable bumpless IK -> FK transitions.
+        """
+        if self.MODE == 1 and len(msg.data) >= 5:
+            for i in range(5):
+                self.target_positions[i] = msg.data[i]
+
     def check_mode_btn(self, new_state: int):
+        """
+        Detects rising edge on the OPTIONS button to toggle between Mode 0 (FK) and Mode 1 (IK).
+        Executes bumpless handoffs:
+          - FK -> IK: Computes 3D Forward Kinematics from current self.target_positions to initialize
+                      Cartesian targets (r, theta, z, world_pitch, roll) at the exact physical gripper pose.
+          - IK -> FK: Resumes joint publishing from self.target_positions (already synchronized via /arm_joint_sync).
+        """
         if new_state == 1 and self.prev_mode_btn_state == 0:
             self.MODE = 1 - self.MODE
             if self.MODE == 1:
-                # TODO: Implement FK -> IK bumpless transition by computing Forward Kinematics
-                #       from self.target_positions to initialize Cartesian targets (r, theta, z, world_pitch, roll).
-                self.get_logger().info("Switched to IK Mode (Cartesian target pose published to /arm_target_pose).")
+                # Bumpless FK -> IK transition: compute Cartesian targets from current joint angles
+                r, theta, z, world_pitch, roll = self.compute_forward_kinematics(self.target_positions)
+                self.target_r = max(self.REACH_LIMITS[0], min(self.REACH_LIMITS[1], r))
+                self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], theta))
+                self.target_z = max(self.ELEV_LIMITS[0], min(self.ELEV_LIMITS[1], z))
+                self.target_world_pitch = max(self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], world_pitch))
+                self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], roll))
+                self.get_logger().info(
+                    f"Switched to IK Mode (Bumpless FK->IK sync: r={self.target_r:.3f}m, "
+                    f"theta={self.target_theta:.3f}rad, z={self.target_z:.3f}m)."
+                )
             else:
-                # TODO: Implement IK -> FK bumpless transition by syncing self.target_positions
-                #       from /joint_states feedback before resuming FK joint publishing on /arm_cmd.
-                self.get_logger().info("Switched to FK Mode (Joint positions published to /arm_cmd).")
+                # Bumpless IK -> FK transition: self.target_positions was continuously mirrored via /arm_joint_sync
+                self.get_logger().info(
+                    f"Switched to FK Mode (Bumpless IK->FK sync: resumed joints "
+                    f"{[round(x, 3) for x in self.target_positions[:5]]})."
+                )
         self.prev_mode_btn_state = new_state
 
     def joy_callback(self, msg: Joy):
@@ -481,7 +503,23 @@ class PS5Mapper(Node):
         self.ry = self.apply_deadzone(msg.axes[self.RJOY_Y], deadzone)
 
     def control_loop(self):
-        """50 Hz control loop: integrates inputs into FK / IK target poses and publishes."""
+        """
+        Main 50 Hz deterministic integration and publishing loop.
+
+        Behavior:
+          - Evaluates safety interlocks (E-Stop latch, watchdog signal loss timeout).
+          - In Mode 0 (FK):
+              * Integrates stick inputs into individual joint angles (self.target_positions).
+              * Clamps angles to JOINT_LIMITS to prevent command windup.
+              * Publishes 6-element Float64MultiArray [J0..J4, gripper] directly to /arm_cmd.
+          - In Mode 1 (IK):
+              * Integrates stick inputs into cylindrical coordinates (r, theta, z, world_pitch, roll).
+              * Clamps Cartesian state to REACH_LIMITS, ELEV_LIMITS, etc.
+              * Publishes PoseStamped to /arm_target_pose for live RViz visualization.
+              * Publishes 6-element Float64MultiArray [r, theta, z, pitch, roll, gripper] to /arm_ik_cmd
+                (commanding ik_solver_node, which solves TRAC-IK and outputs to /arm_cmd).
+          - Gripper integration runs across both modes (D-Pad Left = Open, D-Pad Right = Close).
+        """
         dt = self.DT
         speed_mult = self.get_parameter('precision_scale').value if self.lb_held else 1.0
 
@@ -536,9 +574,9 @@ class PS5Mapper(Node):
                     pose_msg.pose.position.z = self.target_z
 
                     # Compute Auto-Leveling Orientation Quaternion
-                    qx, qy, qz, qw = self.euler_to_quaternion(
-                        self.target_theta, self.target_world_pitch, self.target_roll
-                    )
+                    qx, qy, qz, qw = R.from_euler(
+                        'ZYX', [self.target_theta, self.target_world_pitch, self.target_roll]
+                    ).as_quat()
                     pose_msg.pose.orientation.x = qx
                     pose_msg.pose.orientation.y = qy
                     pose_msg.pose.orientation.z = qz
@@ -599,19 +637,56 @@ class PS5Mapper(Node):
         is_gripping = bool(msg.data[1])
         self.get_logger().info(f"Gripper Feedback: {'Gripping' if is_gripping else 'Not Gripping'}")
 
-        # Left Motor (heavy low-frequency rumble)
         left_msg = JoyFeedback()
         left_msg.type = JoyFeedback.TYPE_RUMBLE
         left_msg.id = 0
         left_msg.intensity = float(msg.data[1])
         self.feedback_publisher.publish(left_msg)
 
-        # Right Motor (light high-frequency buzz)
         right_msg = JoyFeedback()
         right_msg.type = JoyFeedback.TYPE_RUMBLE
         right_msg.id = 1
         right_msg.intensity = float(msg.data[1])
         self.feedback_publisher.publish(right_msg)
+
+    def compute_forward_kinematics(self, joints: list[float]) -> tuple[float, float, float, float, float]:
+        """
+        Computes 3D Forward Kinematics for tool0 relative to base_link from joint angles.
+        Derived from link origin vectors and rotations in arm_cad.urdf.xacro.
+
+        Args:
+            joints: List of joint angles in radians [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, ...].
+
+        Returns:
+            tuple (r, theta, z, world_pitch, roll):
+              - r (float): Radial reach from base to tool0 in horizontal XY plane (meters).
+              - theta (float): Base azimuth angle in base_link frame (radians).
+              - z (float): Vertical elevation of tool0 relative to base_link origin (meters).
+              - world_pitch (float): Gripper pitch angle relative to the ground horizon (radians).
+              - roll (float): Wrist axial roll angle (radians).
+        """
+        q = joints
+
+        def T_mat(rot=None, trans=(0.0, 0.0, 0.0)):
+            T = np.eye(4)
+            if rot is not None:
+                T[:3, :3] = rot.as_matrix()
+            T[:3, 3] = trans
+            return T
+
+        # Chain 4x4 link transforms across the arm joints
+        T = T_mat(trans=(0.043511, -0.012448, 0.03425)) @ T_mat(R.from_euler('z', q[0])) @ T_mat(trans=(0.0145, 0.0, 0.070))
+        T = T @ T_mat(R.from_euler('x', q[1])) @ T_mat(trans=(-0.038, 0.0, 0.450))
+        T = T @ T_mat(R.from_euler('x', q[2])) @ T_mat(trans=(0.0005, -0.47751, -0.22270))
+        T = T @ T_mat(R.from_euler('x', q[3])) @ T_mat(trans=(0.0, -0.01722, -0.00803)) @ T_mat(R.from_euler('x', 0.4363323))
+        T = T @ T_mat(R.from_euler('y', q[4])) @ T_mat(trans=(0.0, -0.043, 0.007)) @ T_mat(R.from_euler('z', np.pi)) @ T_mat(trans=(0.0, 0.175, -0.015))
+
+        px, py, pz = T[:3, 3]
+        r = float(np.hypot(px, py))
+        theta = float(np.arctan2(py, px))
+        world_pitch = float(q[1] + q[2] + q[3])
+        roll = float(q[4])
+        return r, theta, float(pz), world_pitch, roll
 
 
 def main(args=None):
