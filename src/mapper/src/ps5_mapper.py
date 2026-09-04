@@ -112,18 +112,22 @@ class PS5Mapper(Node):
     ]
 
     # Cartesian workspace limits (min, max) in meters / radians
-    # TODO: Update workspace limits with physical robot arm dimensions
-    REACH_LIMITS       = (0.05, 0.60)   # Radial reach (m) from base to TCP
-    ELEV_LIMITS        = (-0.30, 0.60)  # Elevation (m) from base to TCP
+    # Verified via MoveIt FK sweep against arm_cad.urdf.xacro:
+    #   Physical reach r: [0.020, 1.154] m  |  Physical elevation z: [-0.668, 1.253] m
+    # Operational limits are set with a small safety margin inside the physical extremes.
+    REACH_LIMITS       = (0.10, 1.10)   # Radial reach (m) from base to TCP
+    ELEV_LIMITS        = (-0.60, 1.20)  # Elevation (m) from base to TCP
     AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°)
     WORLD_PITCH_LIMITS = (-1.57, 1.57)  # World pitch (rad) relative to horizon (0=horizontal)
     ROLL_LIMITS        = (-3.14, 3.14)  # Wrist axial roll (rad) (±180°)
 
     # Initial Cartesian home state (r, theta, z, world_pitch, roll)
+    # Matches the arm's natural rest posture at all joints = 0.0 rad,
+    # verified by MoveIt FK: tool0 at x=0.020, y=-0.701, z=0.214 in base_link frame.
     HOME_CARTESIAN = {
-        'r': 0.25,
-        'theta': 0.0,
-        'z': 0.15,
+        'r': 0.70,
+        'theta': -1.54,
+        'z': 0.21,
         'world_pitch': 0.0,
         'roll': 0.0
     }
