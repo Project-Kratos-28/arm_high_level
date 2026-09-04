@@ -27,5 +27,10 @@ install(
   DESTINATION share/${PROJECT_NAME}
 )
 
+install(
+  PROGRAMS src/test_with_keyboard.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
 ament_package()
 
