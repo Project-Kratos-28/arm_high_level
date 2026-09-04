@@ -61,6 +61,9 @@ public:
     // Publishes 6-element array [J0, J1, J2, J3, J4, gripper] to /arm_cmd
     arm_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_cmd", 10);
 
+    // Publishes solved joint angles to /arm_joint_sync for bumpless IK -> FK state mirroring in ps5_mapper
+    joint_sync_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_joint_sync", 10);
+
     // ----- Subscriptions -----
     // Subscribes to PS5 Mapper IK commands [r, theta, z, world_pitch, roll, gripper]
     ik_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
@@ -235,6 +238,7 @@ private:
     }
     cmd_msg.data.push_back(last_gripper_val_);
     arm_cmd_pub_->publish(cmd_msg);
+    joint_sync_pub_->publish(cmd_msg);
   }
 
   /**
@@ -276,6 +280,7 @@ private:
   moveit::core::RobotStatePtr kinematic_state_;
 
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr arm_cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr joint_sync_pub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr ik_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_feedback_sub_;
 };
