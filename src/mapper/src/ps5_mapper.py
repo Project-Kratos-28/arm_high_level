@@ -112,6 +112,7 @@ class PS5Mapper(Node):
     ]
 
     # Cartesian workspace limits (min, max) in meters / radians
+    # TODO: Update workspace limits with physical robot arm dimensions
     REACH_LIMITS       = (0.05, 0.60)   # Radial reach (m) from base to TCP
     ELEV_LIMITS        = (-0.30, 0.60)  # Elevation (m) from base to TCP
     AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°)
@@ -244,6 +245,8 @@ class PS5Mapper(Node):
             Float64MultiArray, 'gripper_state', self.grip_feedback_callback, 10
         )
 
+        # TODO: Subscribe to /joint_states for live arm feedback and bumpless mode handoff
+
         # Arm position commands: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
         self.publisher = self.create_publisher(
             Float64MultiArray, 'arm_cmd', 10
@@ -343,11 +346,12 @@ class PS5Mapper(Node):
         if new_state == 1 and self.prev_mode_btn_state == 0:
             self.MODE = 1 - self.MODE
             if self.MODE == 1:
-                # NOTE: Initial implementation assumes ideal robot tracking. In the future,
-                # we can synchronize self.target_r, self.target_theta, etc., with /joint_states feedback.
+                # TODO: Implement FK -> IK bumpless transition by computing Forward Kinematics
+                #       from self.target_positions to initialize Cartesian targets (r, theta, z, world_pitch, roll).
                 self.get_logger().info("Switched to IK Mode (Cartesian target pose published to /arm_target_pose).")
             else:
-                # NOTE: In the future, synchronize self.target_positions with /joint_states feedback when switching back.
+                # TODO: Implement IK -> FK bumpless transition by syncing self.target_positions
+                #       from /joint_states feedback before resuming FK joint publishing on /arm_cmd.
                 self.get_logger().info("Switched to FK Mode (Joint positions published to /arm_cmd).")
         self.prev_mode_btn_state = new_state
 
