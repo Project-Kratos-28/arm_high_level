@@ -23,9 +23,23 @@ ament_target_dependencies(ik_solver_node
   moveit_ros_planning
 )
 
+add_executable(trac_ik_benchmark src/trac_ik_benchmark.cpp)
+ament_target_dependencies(trac_ik_benchmark
+  rclcpp
+  geometry_msgs
+  moveit_core
+  moveit_ros_planning
+)
+
 install(TARGETS
   ik_solver_node
+  trac_ik_benchmark
   DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+  DIRECTORY launch
+  DESTINATION share/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
