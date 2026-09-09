@@ -62,6 +62,31 @@ def generate_launch_description():
         default_value="0.05",
         description="Step size in milliseconds for sweep",
     )
+    workspace_map_arg = DeclareLaunchArgument(
+        "workspace_map",
+        default_value="false",
+        description="Enable workspace reachability and failure map mode",
+    )
+    map_r_steps_arg = DeclareLaunchArgument(
+        "map_r_steps",
+        default_value="25",
+        description="Number of radial reach (r) steps",
+    )
+    map_z_steps_arg = DeclareLaunchArgument(
+        "map_z_steps",
+        default_value="30",
+        description="Number of elevation (z) steps",
+    )
+    map_pitch_steps_arg = DeclareLaunchArgument(
+        "map_pitch_steps",
+        default_value="7",
+        description="Number of world_pitch slices",
+    )
+    map_attempts_arg = DeclareLaunchArgument(
+        "map_attempts",
+        default_value="5",
+        description="Number of IK solve attempts per cell from random seeds",
+    )
 
     samples = LaunchConfiguration("samples")
     timeout = LaunchConfiguration("timeout")
@@ -69,6 +94,11 @@ def generate_launch_description():
     sweep_min_ms = LaunchConfiguration("sweep_min_ms")
     sweep_max_ms = LaunchConfiguration("sweep_max_ms")
     sweep_step_ms = LaunchConfiguration("sweep_step_ms")
+    workspace_map = LaunchConfiguration("workspace_map")
+    map_r_steps = LaunchConfiguration("map_r_steps")
+    map_z_steps = LaunchConfiguration("map_z_steps")
+    map_pitch_steps = LaunchConfiguration("map_pitch_steps")
+    map_attempts = LaunchConfiguration("map_attempts")
 
     # 1. Robot Description (URDF from xacro)
     xacro_file = os.path.join(pkg_arm_controller, "urdf", "arm_cad.urdf.xacro")
@@ -116,6 +146,11 @@ def generate_launch_description():
                 "sweep_min_ms": sweep_min_ms,
                 "sweep_max_ms": sweep_max_ms,
                 "sweep_step_ms": sweep_step_ms,
+                "workspace_map": workspace_map,
+                "map_r_steps": map_r_steps,
+                "map_z_steps": map_z_steps,
+                "map_pitch_steps": map_pitch_steps,
+                "map_attempts": map_attempts,
             },
         ],
     )
@@ -128,6 +163,11 @@ def generate_launch_description():
             sweep_min_arg,
             sweep_max_arg,
             sweep_step_arg,
+            workspace_map_arg,
+            map_r_steps_arg,
+            map_z_steps_arg,
+            map_pitch_steps_arg,
+            map_attempts_arg,
             benchmark_node,
         ]
     )

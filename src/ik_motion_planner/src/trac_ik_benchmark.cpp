@@ -94,6 +94,31 @@ public:
       this->declare_parameter<double>("sweep_step_ms", 0.05);
     }
     sweep_step_ms_ = this->get_parameter("sweep_step_ms").as_double();
+
+    if (!this->has_parameter("workspace_map")) {
+      this->declare_parameter<bool>("workspace_map", false);
+    }
+    workspace_map_ = this->get_parameter("workspace_map").as_bool();
+
+    if (!this->has_parameter("map_r_steps")) {
+      this->declare_parameter<int>("map_r_steps", 25);
+    }
+    map_r_steps_ = this->get_parameter("map_r_steps").as_int();
+
+    if (!this->has_parameter("map_z_steps")) {
+      this->declare_parameter<int>("map_z_steps", 30);
+    }
+    map_z_steps_ = this->get_parameter("map_z_steps").as_int();
+
+    if (!this->has_parameter("map_pitch_steps")) {
+      this->declare_parameter<int>("map_pitch_steps", 7);
+    }
+    map_pitch_steps_ = this->get_parameter("map_pitch_steps").as_int();
+
+    if (!this->has_parameter("map_attempts")) {
+      this->declare_parameter<int>("map_attempts", 5);
+    }
+    map_attempts_ = this->get_parameter("map_attempts").as_int();
   }
 
   bool initialize()
@@ -127,7 +152,10 @@ public:
     RCLCPP_INFO(this->get_logger(), "Active Joints:        %zu", joint_model_group_->getActiveJointModelNames().size());
     RCLCPP_INFO(this->get_logger(), "Kinematics Plugin:    %s", solver_name.c_str());
     RCLCPP_INFO(this->get_logger(), "Sample Size:          %d per test", samples_);
-    if (sweep_) {
+    if (workspace_map_) {
+      RCLCPP_INFO(this->get_logger(), "Mode:                 WORKSPACE FAILURE MAP (%d x %d x %d grid, %d attempts/cell)",
+        map_r_steps_, map_z_steps_, map_pitch_steps_, map_attempts_);
+    } else if (sweep_) {
       RCLCPP_INFO(this->get_logger(), "Mode:                 PARAMETRIC SWEEP (%.2f ms -> %.2f ms, step %.2f ms)",
         sweep_min_ms_, sweep_max_ms_, sweep_step_ms_);
     } else {
@@ -140,7 +168,9 @@ public:
 
   void execute()
   {
-    if (sweep_) {
+    if (workspace_map_) {
+      runWorkspaceMap();
+    } else if (sweep_) {
       runTimeoutSweep(sweep_min_ms_, sweep_max_ms_, sweep_step_ms_, samples_);
     } else {
       auto warm = runWarmStartBenchmark(ik_timeout_, samples_);
@@ -482,6 +512,111 @@ public:
     std::cout << "========================================================================================\n\n";
   }
 
+  void runWorkspaceMap()
+  {
+    std::cout << "\n========================================================================================\n";
+    std::cout << "                 TRAC-IK WORKSPACE REACHABILITY & FAILURE MAP                           \n";
+    std::cout << "                 Grid: " << map_r_steps_ << " (r) x " << map_z_steps_ << " (z) x " << map_pitch_steps_ << " (pitch)\n";
+    std::cout << "                 Total Cells: " << (map_r_steps_ * map_z_steps_ * map_pitch_steps_)
+              << " | Attempts/Cell: " << map_attempts_ << " | Timeout: " << std::fixed << std::setprecision(2) << (ik_timeout_ * 1000.0) << " ms\n";
+    std::cout << "========================================================================================\n" << std::flush;
+
+    const double r_min = 0.0;
+    const double r_max = 1.25;
+    const double r_step = (map_r_steps_ > 1) ? ((r_max - r_min) / (map_r_steps_ - 1)) : 0.0;
+
+    const double z_min = -0.70;
+    const double z_max = 1.30;
+    const double z_step = (map_z_steps_ > 1) ? ((z_max - z_min) / (map_z_steps_ - 1)) : 0.0;
+
+    const double pitch_min = -M_PI / 2.0;
+    const double pitch_max = M_PI / 2.0;
+    const double pitch_step = (map_pitch_steps_ > 1) ? ((pitch_max - pitch_min) / (map_pitch_steps_ - 1)) : 0.0;
+
+    std::ofstream csv("ik_workspace_map.csv");
+    if (!csv.is_open()) {
+      RCLCPP_ERROR(this->get_logger(), "Failed to open ik_workspace_map.csv for writing!");
+      return;
+    }
+    csv << "r,z,world_pitch,success_rate,n_success,n_attempts\n";
+
+    auto t_start_total = std::chrono::steady_clock::now();
+    size_t total_reachable_cells = 0;
+    size_t total_cells = map_r_steps_ * map_z_steps_ * map_pitch_steps_;
+
+    for (int k = 0; k < map_pitch_steps_; ++k) {
+      double pitch = pitch_min + k * pitch_step;
+      Eigen::Quaterniond q(Eigen::AngleAxisd(pitch, Eigen::Vector3d::UnitY()));
+      size_t pitch_reachable = 0;
+      size_t pitch_cells = map_r_steps_ * map_z_steps_;
+
+      auto t_slice_start = std::chrono::steady_clock::now();
+
+      for (int j = 0; j < map_z_steps_; ++j) {
+        double z = z_min + j * z_step;
+
+        for (int i = 0; i < map_r_steps_; ++i) {
+          double r = r_min + i * r_step;
+
+          geometry_msgs::msg::Pose target_pose;
+          target_pose.position.x = r;
+          target_pose.position.y = 0.0;
+          target_pose.position.z = z;
+          target_pose.orientation.x = q.x();
+          target_pose.orientation.y = q.y();
+          target_pose.orientation.z = q.z();
+          target_pose.orientation.w = q.w();
+
+          int successes = 0;
+          for (int a = 0; a < map_attempts_; ++a) {
+            kinematic_state_->setToRandomPositions(joint_model_group_);
+            kinematic_state_->enforceBounds(joint_model_group_);
+            bool ok = kinematic_state_->setFromIK(joint_model_group_, target_pose, tip_frame_, ik_timeout_);
+            if (ok) {
+              successes++;
+            }
+          }
+
+          double success_rate = static_cast<double>(successes) / map_attempts_;
+          if (successes > 0) {
+            pitch_reachable++;
+            total_reachable_cells++;
+          }
+
+          csv << std::fixed << std::setprecision(4) << r << ","
+              << std::fixed << std::setprecision(4) << z << ","
+              << std::fixed << std::setprecision(4) << pitch << ","
+              << std::fixed << std::setprecision(3) << success_rate << ","
+              << successes << ","
+              << map_attempts_ << "\n";
+        }
+      }
+
+      auto t_slice_end = std::chrono::steady_clock::now();
+      double slice_sec = std::chrono::duration<double>(t_slice_end - t_slice_start).count();
+      double pct_reachable = (static_cast<double>(pitch_reachable) / pitch_cells) * 100.0;
+
+      std::cout << "[workspace_map] Pitch slice " << (k + 1) << "/" << map_pitch_steps_
+                << " (" << std::fixed << std::setprecision(2) << pitch << " rad / "
+                << std::fixed << std::setprecision(1) << (pitch * 180.0 / M_PI) << " deg): "
+                << pitch_reachable << "/" << pitch_cells << " cells reachable ("
+                << std::fixed << std::setprecision(1) << pct_reachable << "%)"
+                << " [" << std::fixed << std::setprecision(1) << slice_sec << "s]\n"
+                << std::flush;
+    }
+
+    csv.close();
+    auto t_end_total = std::chrono::steady_clock::now();
+    double total_sec = std::chrono::duration<double>(t_end_total - t_start_total).count();
+
+    std::cout << "========================================================================================\n";
+    std::cout << "WORKSPACE MAP COMPLETED in " << std::fixed << std::setprecision(1) << total_sec << "s\n";
+    std::cout << "Total reachable cells: " << total_reachable_cells << "/" << total_cells
+              << " (" << std::fixed << std::setprecision(1) << ((static_cast<double>(total_reachable_cells) / total_cells) * 100.0) << "%)\n";
+    std::cout << "Results written to: ik_workspace_map.csv\n";
+    std::cout << "========================================================================================\n\n";
+  }
+
 private:
   BenchmarkStats computeStats(
     const std::string & name,
@@ -527,6 +662,11 @@ private:
   double sweep_min_ms_;
   double sweep_max_ms_;
   double sweep_step_ms_;
+  bool workspace_map_;
+  int map_r_steps_;
+  int map_z_steps_;
+  int map_pitch_steps_;
+  int map_attempts_;
 
   std::shared_ptr<robot_model_loader::RobotModelLoader> robot_model_loader_;
   moveit::core::RobotModelPtr kinematic_model_;
