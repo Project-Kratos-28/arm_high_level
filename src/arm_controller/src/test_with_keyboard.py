@@ -63,8 +63,8 @@ class KeyboardTeleopBridge(Node):
             Float64MultiArray, 'arm_cmd', self.arm_cmd_callback, 10
         )
 
-        # Internal joint position storage [J0..J4, gripper]
-        self.current_joints = [0.0] * 6
+        # Internal joint position storage [J0..J4, gripper] — initial home posture (elbow bent 115 deg)
+        self.current_joints = [0.0, 0.0, 2.0072, 0.0, 0.0, 0.0]
         self.lock = threading.Lock()
 
         # PS5 Controller State Simulation
@@ -115,7 +115,7 @@ class KeyboardTeleopBridge(Node):
         joy_msg.header.frame_id = 'teleop_keyboard'
         joy_msg.axes = list(self.axes)
         joy_msg.buttons = list(self.buttons)
-        self.joy_pub.publish(joy_msg)
+        # self.joy_pub.publish(joy_msg)
 
         # Clear one-shot buttons after one tick
         if self.buttons[9] == 1:

@@ -151,7 +151,8 @@
     <parent link="elbow_fixed_link" />
     <child link="elbow_link" />
     
-    <origin xyz="-0.047 0.000022 0.000039" rpy="0 0 0" />
+    <!-- rpy aligns Link 2 (forearm) collinearly with Link 1 (upper arm) at elbow=0 -->
+    <origin xyz="-0.047 0.000022 0.000039" rpy="-2.00719 0 0" />
     <axis xyz="1 0 0" />
     <limit lower="-2.50" upper="2.50" effort="100" velocity="1" />
   </joint>

@@ -104,8 +104,8 @@ class PS5Mapper(Node):
 
     DEADZONE = 0.1
 
-    # Home positions (radians) — all joints start here on node startup
-    HOME_POSITIONS = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    # Home positions (radians) — elbow at +2.0072 rad (115° forward from straight-up reference)
+    HOME_POSITIONS = [0.0, 0.0, 2.0072, 0.0, 0.0, 0.0]
     # Index mapping: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
 
     # Software joint limits (min, max) in radians — prevents command windup
@@ -136,12 +136,11 @@ class PS5Mapper(Node):
     WORKSPACE_RADIUS   = 1.10           # Usable workspace sphere radius (m) (physical max: 1.154 m)
 
     # Initial Cartesian home state (r, theta, z, world_pitch, roll)
-    # Matches the arm's natural rest posture at all joints = 0.0 rad,
-    # verified by MoveIt FK: tool0 at x=0.020, y=-0.701, z=0.214 in base_link frame.
+    # Home posture at q=[0,0,2.0072,0,0,0]: tool0 at r=0.70m, z=0.22m (workspace center)
     HOME_CARTESIAN = {
         'r': 0.70,
         'theta': -1.54,
-        'z': 0.21,
+        'z': 0.22,
         'world_pitch': 0.0,
         'roll': 0.0
     }
@@ -706,14 +705,16 @@ class PS5Mapper(Node):
         # Chain 4x4 link transforms across the arm joints
         T = T_mat(trans=(0.043511, -0.012448, 0.03425)) @ T_mat(R.from_euler('z', q[0])) @ T_mat(trans=(0.0145, 0.0, 0.070))
         T = T @ T_mat(R.from_euler('x', q[1])) @ T_mat(trans=(-0.038, 0.0, 0.450))
-        T = T @ T_mat(R.from_euler('x', q[2])) @ T_mat(trans=(0.0005, -0.47751, -0.22270))
+        # Elbow joint origin rpy="-2.00719 0 0" (makes q[2]=0 the straight-arm reference)
+        T = T @ T_mat(R.from_euler('x', -2.00719)) @ T_mat(R.from_euler('x', q[2])) @ T_mat(trans=(0.0005, -0.47751, -0.22270))
         T = T @ T_mat(R.from_euler('x', q[3])) @ T_mat(trans=(0.0, -0.01722, -0.00803)) @ T_mat(R.from_euler('x', 0.4363323))
         T = T @ T_mat(R.from_euler('y', q[4])) @ T_mat(trans=(0.0, -0.043, 0.007)) @ T_mat(R.from_euler('z', np.pi)) @ T_mat(trans=(0.0, 0.175, -0.015))
 
         px, py, pz = T[:3, 3]
         r = float(np.hypot(px, py))
         theta = float(np.arctan2(py, px))
-        world_pitch = float(q[1] + q[2] + q[3])
+        # Elbow offset of -2.00719 rad must be subtracted (q[2]=0 = straight, not bent)
+        world_pitch = float(q[1] + q[2] + q[3] - 2.00719)
         roll = float(q[4])
         return r, theta, float(pz), world_pitch, roll
 

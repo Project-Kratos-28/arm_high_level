@@ -52,8 +52,8 @@ public:
       "wrist_roll_joint"
     };
 
-    // Initialize commanded joints at home (0.0)
-    current_arm_joints_.assign(joint_names_.size(), 0.0);
+    // Seed warm-start at home posture so first IK query converges near home
+    current_arm_joints_ = {0.0, 0.0, 2.0072, 0.0, 0.0};
     last_gripper_val_ = 0.0;
     has_valid_solution_ = true;
 
@@ -153,6 +153,20 @@ public:
       r_min, r_max, z_min, z_max);
     RCLCPP_INFO(this->get_logger(),
       "Azimuth theta=[-3.14, +3.14] rad (full 360 deg via base_yaw_joint)");
+
+    // Set RobotState to home posture for accurate startup FK state
+    for (size_t i = 0; i < joint_names_.size(); ++i) {
+      kinematic_state_->setVariablePosition(joint_names_[i], current_arm_joints_[i]);
+    }
+    kinematic_state_->update();
+
+    // Publish initial home posture — synchronizes /arm_cmd and ps5_mapper FK state
+    std_msgs::msg::Float64MultiArray init_cmd;
+    init_cmd.data = current_arm_joints_;
+    init_cmd.data.push_back(last_gripper_val_);
+    arm_cmd_pub_->publish(init_cmd);
+    joint_sync_pub_->publish(init_cmd);
+    RCLCPP_INFO(this->get_logger(), "Published initial home posture: elbow=+2.0072 rad.");
   }
 
 private:
