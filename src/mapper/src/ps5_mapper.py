@@ -112,7 +112,7 @@ class PS5Mapper(Node):
     JOINT_LIMITS = [
         (-3.14,  3.14),   # 0: Base Yaw        (±180°)
         (-1.57,  1.57),   # 1: Shoulder Pitch  (±90°)
-        (-2.09,  2.09),   # 2: Elbow Pitch     (±120°)
+        (-2.50,  2.50),   # 2: Elbow Pitch     (±143.2°) — matches arm_cad.urdf.xacro
         (-1.57,  1.57),   # 3: Wrist Pitch     (±90°)
         (-3.14,  3.14),   # 4: Wrist Roll      (±180°)
         (-0.35,  1.57),   # 5: Gripper
@@ -127,6 +127,13 @@ class PS5Mapper(Node):
     AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°)
     WORLD_PITCH_LIMITS = (-1.57, 1.57)  # World pitch (rad) relative to horizon (0=horizontal)
     ROLL_LIMITS        = (-3.14, 3.14)  # Wrist axial roll (rad) (±180°)
+
+    # Spherical workspace envelope — replaces independent r/z rectangle clamp.
+    # Model: sphere centered at (r=0, z=SHOULDER_PIVOT_Z) with radius WORKSPACE_RADIUS.
+    # Derived from MoveIt FK sweep: max reach = 1.154 m, shoulder pivot height ≈ 0.20 m.
+    # Safety margin of 0.05 m inside physical max to avoid hard joint-limit singularities.
+    SHOULDER_PIVOT_Z   = 0.20           # Shoulder joint pivot height (m) above base_link
+    WORKSPACE_RADIUS   = 1.10           # Usable workspace sphere radius (m) (physical max: 1.154 m)
 
     # Initial Cartesian home state (r, theta, z, world_pitch, roll)
     # Matches the arm's natural rest posture at all joints = 0.0 rad,
@@ -289,6 +296,27 @@ class PS5Mapper(Node):
             return 0.0
         return min(1.0, normalized)
 
+    def _clamp_to_workspace_sphere(self):
+        """
+        Enforces that (target_r, target_z) lies inside the spherical kinematic envelope:
+            r² + (z - SHOULDER_PIVOT_Z)² ≤ WORKSPACE_RADIUS²
+        Also applies the hard floor/ceiling on z and minimum-r floor (base column deadzone).
+
+        This replaces independent rectangle clamping on r and z, preventing
+        the IK solver from being commanded into corners that are kinematically
+        unreachable (which causes silent stick freezes / position hold).
+        """
+        # 1. Hard floor/ceiling on z (absolute physical extremes)
+        self.target_z = max(self.ELEV_LIMITS[0], min(self.ELEV_LIMITS[1], self.target_z))
+
+        # 2. Spherical ceiling on r given current z
+        z_rel = self.target_z - self.SHOULDER_PIVOT_Z
+        r_max_at_z = math.sqrt(max(0.0, self.WORKSPACE_RADIUS**2 - z_rel**2))
+        r_max_at_z = min(r_max_at_z, self.REACH_LIMITS[1])  # also honour absolute r ceiling
+
+        # 3. Clamp r into [r_min, r_max_at_z]
+        self.target_r = max(self.REACH_LIMITS[0], min(r_max_at_z, self.target_r))
+
     def _apply_speed_delta(self, axis_name: str, delta: float, min_s: float, max_s: float):
         """Increments or decrements joint / Cartesian max speed within safe bounds and logs update."""
         if axis_name in ("Base Yaw", "Azimuth"):
@@ -364,9 +392,10 @@ class PS5Mapper(Node):
             if self.MODE == 1:
                 # Bumpless FK -> IK transition: compute Cartesian targets from current joint angles
                 r, theta, z, world_pitch, roll = self.compute_forward_kinematics(self.target_positions)
-                self.target_r = max(self.REACH_LIMITS[0], min(self.REACH_LIMITS[1], r))
+                self.target_r = r
+                self.target_z = z
+                self._clamp_to_workspace_sphere()
                 self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], theta))
-                self.target_z = max(self.ELEV_LIMITS[0], min(self.ELEV_LIMITS[1], z))
                 self.target_world_pitch = max(self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], world_pitch))
                 self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], roll))
                 self.get_logger().info(
@@ -514,7 +543,8 @@ class PS5Mapper(Node):
               * Publishes 6-element Float64MultiArray [J0..J4, gripper] directly to /arm_cmd.
           - In Mode 1 (IK):
               * Integrates stick inputs into cylindrical coordinates (r, theta, z, world_pitch, roll).
-              * Clamps Cartesian state to REACH_LIMITS, ELEV_LIMITS, etc.
+              * Clamps Cartesian state to spherical workspace envelope (WORKSPACE_RADIUS, SHOULDER_PIVOT_Z)
+                plus azimuth, world_pitch, and roll hard limits.
               * Publishes PoseStamped to /arm_target_pose for live RViz visualization.
               * Publishes 6-element Float64MultiArray [r, theta, z, pitch, roll, gripper] to /arm_ik_cmd
                 (commanding ik_solver_node, which solves TRAC-IK and outputs to /arm_cmd).
@@ -556,9 +586,8 @@ class PS5Mapper(Node):
                         self.target_world_pitch += self.ry * self.max_world_pitch_speed * speed_mult * dt
                         self.target_roll += self.rx * self.max_roll_speed * speed_mult * dt
 
-                    # Clamp Cartesian targets to workspace boundaries
-                    self.target_r = max(self.REACH_LIMITS[0], min(self.REACH_LIMITS[1], self.target_r))
-                    self.target_z = max(self.ELEV_LIMITS[0], min(self.ELEV_LIMITS[1], self.target_z))
+                    # Clamp Cartesian targets to spherical workspace envelope
+                    self._clamp_to_workspace_sphere()
                     self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], self.target_theta))
                     self.target_world_pitch = max(
                         self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], self.target_world_pitch)
