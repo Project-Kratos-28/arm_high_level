@@ -35,7 +35,7 @@ public:
     tip_frame_ = this->get_parameter("tip_frame").as_string();
 
     if (!this->has_parameter("ik_timeout")) {
-      this->declare_parameter<double>("ik_timeout", 0.0006);
+      this->declare_parameter<double>("ik_timeout", 0.001);
     }
     ik_timeout_ = this->get_parameter("ik_timeout").as_double();
 

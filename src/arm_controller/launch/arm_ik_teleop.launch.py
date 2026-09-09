@@ -106,7 +106,7 @@ def generate_launch_description():
                 "planning_group": "arm",
                 "base_frame": "base_link",
                 "tip_frame": "tool0",
-                "ik_timeout": 0.0006,
+                "ik_timeout": 0.001,
                 "use_live_joint_states": False,
                 "use_sim_time": use_sim_time,
             },
