@@ -106,6 +106,8 @@ def generate_launch_description():
                 "planning_group": "arm",
                 "base_frame": "base_link",
                 "tip_frame": "tool0",
+                "wrist_planning_group": "arm_wrist",
+                "wrist_tip_frame": "wrist_center",
                 "ik_timeout": 0.001,
                 "use_live_joint_states": False,
                 "use_sim_time": use_sim_time,

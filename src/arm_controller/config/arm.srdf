@@ -12,6 +12,9 @@
     <group name="arm">
         <chain base_link="base_link" tip_link="tool0"/>
     </group>
+    <group name="arm_wrist">
+        <chain base_link="base_link" tip_link="wrist_center"/>
+    </group>
     <group name="gripper">
         <joint name="gripper_joint"/>
     </group>
