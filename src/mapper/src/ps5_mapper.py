@@ -526,7 +526,16 @@ class PS5Mapper(Node):
 
             self.prev_rt_active = rt_active
             self.prev_lt_active = lt_active
-            return  # Don't update stick axes while tuning
+
+            # Safety Lockout: Zero stick inputs and reset axis lock filter during speed tuning
+            self.lx = 0.0
+            self.ly = 0.0
+            self.rx = 0.0
+            self.ry = 0.0
+            self.left_stick_lock.locked_axis = None
+            self.lb_held = bool(msg.buttons[self.LB])
+            self.rb_held = bool(msg.buttons[self.RB])
+            return
 
         # Reset trigger edge state when shape buttons are released
         self.prev_rt_active = False
@@ -629,51 +638,6 @@ class PS5Mapper(Node):
                     )
                     self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], self.target_roll))
 
-                    # Compute Cartesian Coordinates (wrist_center relative to base_link)
-                    pose_msg = PoseStamped()
-                    pose_msg.header.stamp = self.get_clock().now().to_msg()
-                    pose_msg.header.frame_id = 'base_link'
-                    pose_msg.pose.position.x = (
-                        self.BASE_PIVOT_X
-                        + self.target_r * math.sin(self.target_theta)
-                        + self.ARM_LATERAL_OFFSET * math.cos(self.target_theta)
-                    )
-                    pose_msg.pose.position.y = (
-                        self.BASE_PIVOT_Y
-                        - self.target_r * math.cos(self.target_theta)
-                        + self.ARM_LATERAL_OFFSET * math.sin(self.target_theta)
-                    )
-                    pose_msg.pose.position.z = self.target_z
-
-                    # Compute Auto-Leveling Orientation Quaternion matching physical tool0 frame:
-                    # R_tool0 = R_z(theta) @ R_x(-world_pitch) @ R_y(roll) @ R_z(pi)
-                    r_mat = (
-                        R.from_euler('z', self.target_theta).as_matrix()
-                        @ R.from_euler('x', -self.target_world_pitch).as_matrix()
-                        @ R.from_euler('y', self.target_roll).as_matrix()
-                        @ R.from_euler('z', np.pi).as_matrix()
-                    )
-                    qx, qy, qz, qw = R.from_matrix(r_mat).as_quat()
-                    pose_msg.pose.orientation.x = float(qx)
-                    pose_msg.pose.orientation.y = float(qy)
-                    pose_msg.pose.orientation.z = float(qz)
-                    pose_msg.pose.orientation.w = float(qw)
-
-                    # Publish Cartesian Pose for visualization (RViz / MoveIt)
-                    self.target_pose_pub.publish(pose_msg)
-
-                    # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
-                    ik_msg = Float64MultiArray()
-                    ik_msg.data = [
-                        float(self.target_r),
-                        float(self.target_theta),
-                        float(self.target_z),
-                        float(self.target_world_pitch),
-                        float(self.target_roll),
-                        float(self.target_positions[5])
-                    ]
-                    self.ik_target_pub.publish(ik_msg)
-
             # Gripper integration (always active, even during arm speed tuning)
             if self.dpad_x > 0.5:
                 self.target_positions[5] += self.max_gripper_speed * speed_mult * dt    # Open
@@ -686,12 +650,58 @@ class PS5Mapper(Node):
 
         # Mode-Gated Publishing:
         # FK Mode: ps5_mapper directly publishes [J0..J4, Gripper] to /arm_cmd and /arm_fk_sync
-        # IK Mode: ps5_mapper published to /arm_ik_cmd above; the IK Solver will publish to /arm_cmd
+        # IK Mode: ps5_mapper publishes [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
+        #          and PoseStamped to /arm_target_pose; ik_solver_node solves TRAC-IK and outputs to /arm_cmd
         if self.MODE == 0:
             cmd_msg = Float64MultiArray()
             cmd_msg.data = list(self.target_positions)
             self.publisher.publish(cmd_msg)
             self.fk_sync_pub.publish(cmd_msg)
+        elif self.MODE == 1:
+            # Compute Cartesian Coordinates (wrist_center relative to base_link)
+            pose_msg = PoseStamped()
+            pose_msg.header.stamp = self.get_clock().now().to_msg()
+            pose_msg.header.frame_id = 'base_link'
+            pose_msg.pose.position.x = (
+                self.BASE_PIVOT_X
+                + self.target_r * math.sin(self.target_theta)
+                + self.ARM_LATERAL_OFFSET * math.cos(self.target_theta)
+            )
+            pose_msg.pose.position.y = (
+                self.BASE_PIVOT_Y
+                - self.target_r * math.cos(self.target_theta)
+                + self.ARM_LATERAL_OFFSET * math.sin(self.target_theta)
+            )
+            pose_msg.pose.position.z = self.target_z
+
+            # Compute Auto-Leveling Orientation Quaternion matching physical tool0 frame:
+            # R_tool0 = R_z(theta) @ R_x(-world_pitch) @ R_y(roll) @ R_z(pi)
+            r_mat = (
+                R.from_euler('z', self.target_theta).as_matrix()
+                @ R.from_euler('x', -self.target_world_pitch).as_matrix()
+                @ R.from_euler('y', self.target_roll).as_matrix()
+                @ R.from_euler('z', np.pi).as_matrix()
+            )
+            qx, qy, qz, qw = R.from_matrix(r_mat).as_quat()
+            pose_msg.pose.orientation.x = float(qx)
+            pose_msg.pose.orientation.y = float(qy)
+            pose_msg.pose.orientation.z = float(qz)
+            pose_msg.pose.orientation.w = float(qw)
+
+            # Publish Cartesian Pose for visualization (RViz / MoveIt)
+            self.target_pose_pub.publish(pose_msg)
+
+            # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
+            ik_msg = Float64MultiArray()
+            ik_msg.data = [
+                float(self.target_r),
+                float(self.target_theta),
+                float(self.target_z),
+                float(self.target_world_pitch),
+                float(self.target_roll),
+                float(self.target_positions[5])
+            ]
+            self.ik_target_pub.publish(ik_msg)
 
     def watchdog_callback(self):
         """Monitors joystick heartbeat; sets signal_lost flag if communication drops."""
