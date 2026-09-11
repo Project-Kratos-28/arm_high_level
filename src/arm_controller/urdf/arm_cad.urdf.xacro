@@ -1,6 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="arm">
-<xacro:include filename="$(find realsense2_description)/urdf/_d435i.urdf.xacro"/>
+
 <xacro:arg name="use_mock_hardware" default="false"/>
 <xacro:arg name="use_gazebo" default="false"/>  
 
@@ -154,7 +154,7 @@
     <!-- rpy aligns Link 2 (forearm) collinearly with Link 1 (upper arm) at elbow=0 -->
     <origin xyz="-0.047 0.000022 0.000039" rpy="-2.00719 0 0" />
     <axis xyz="1 0 0" />
-    <limit lower="-2.50" upper="2.50" effort="100" velocity="1" />
+    <limit lower="0.0" upper="2.50" effort="100" velocity="1" />
   </joint>
 
   <link name="bevel_link">
@@ -185,6 +185,15 @@
     <axis xyz="1 0 0" />
     <limit lower="-1.57" upper="1.57" effort="100" velocity="1" />
   </joint>
+
+  <!-- Wrist pitch axis center frame for decoupled 3-DOF positioning -->
+  <joint name="wrist_center_joint" type="fixed">
+    <parent link="bevel_link" />
+    <child link="wrist_center" />
+    <origin xyz="0 -0.117291 -0.054694" rpy="0 0 0" />
+  </joint>
+
+  <link name="wrist_center" />
 
   <link name="wrist_pitch_link">
     <visual>
@@ -253,22 +262,6 @@
   </joint>
 
   <link name="tool0"/>
-
-  <!-- ========================= -->
-  <!-- Intel RealSense D435i Mount -->
-  <!-- ========================= -->
-  <xacro:sensor_d435i
-    parent="gripper_link"
-    name="camera"
-    use_nominal_extrinsics="true">
-
-    <origin
-        xyz="0 0.03 0.07"
-        rpy="0 0 ${PI/2}"/>
-
-  </xacro:sensor_d435i>
-
-
 
   <link name="upper_jaw_link">
     <visual>
@@ -354,36 +347,7 @@
     </parameters>
   </plugin>
 </gazebo>
-
-<gazebo reference="camera_link">
-  <sensor name="d435i_rgbd" type="rgbd_camera">
-
-    <always_on>true</always_on>
-    <visualize>true</visualize>
-    <update_rate>30</update_rate>
-
-    <topic>camera</topic>
-    <gz_frame_id>camera_link</gz_frame_id>
-
-    <camera>
-      <horizontal_fov>1.211</horizontal_fov>
-
-      <camera_info_topic>camera/camera_info</camera_info_topic>
-
-      <image>
-        <width>1920</width>
-        <height>1080</height>
-        <format>R8G8B8</format>
-      </image>
-
-      <clip>
-        <near>0.1</near>
-        <far>10.0</far>
-      </clip>
-    </camera>
-
-  </sensor>
-</gazebo>
+<!--Camera Part Removed -->
 
 </robot>
 
