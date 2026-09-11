@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 3.8)
+set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
 project(ik_motion_planner)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -31,9 +32,18 @@ ament_target_dependencies(trac_ik_benchmark
   moveit_ros_planning
 )
 
+add_executable(fk_ik_reachability_checker src/fk_ik_reachability_checker.cpp)
+ament_target_dependencies(fk_ik_reachability_checker
+  rclcpp
+  geometry_msgs
+  moveit_core
+  moveit_ros_planning
+)
+
 install(TARGETS
   ik_solver_node
   trac_ik_benchmark
+  fk_ik_reachability_checker
   DESTINATION lib/${PROJECT_NAME}
 )
 
