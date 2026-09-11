@@ -13,8 +13,8 @@ from std_msgs.msg import Float64MultiArray
 class StickAxisLock:
     """
     Filters 2-axis joystick input by locking onto the dominant axis once moved outside
-    the deadzone. Prevents accidental diagonal cross-talk (e.g. moving X while pushing Y).
-    The lock resets when the stick returns to the deadzone center.
+    the deadzone, while allowing clean dynamic switching when the user deliberately deflects
+    the secondary axis. Prevents accidental diagonal cross-talk without locking the user out.
     """
 
     def __init__(self):
@@ -35,6 +35,12 @@ class StickAxisLock:
                 self.locked_axis = 'Y'
             else:
                 self.locked_axis = 'X'
+        else:
+            # Allow clean dynamic transfer if secondary axis becomes noticeably dominant
+            if self.locked_axis == 'Y' and abs_x > max(deadzone * 1.5, abs_y * 1.2):
+                self.locked_axis = 'X'
+            elif self.locked_axis == 'X' and abs_y > max(deadzone * 1.5, abs_x * 1.2):
+                self.locked_axis = 'Y'
 
         # Pass only the locked axis, strictly suppressing the other
         if self.locked_axis == 'Y':
@@ -51,10 +57,14 @@ class PS5Mapper(Node):
 
     Features:
       - Dual-Mode Teleoperation (toggled via OPTIONS button):
-          * Mode 0 (FK): Joint-by-joint angle integration published directly to /arm_cmd.
-          * Mode 1 (IK): Cylindrical Cartesian end-effector control (TCP tool0) published to /arm_ik_cmd.
+          * Mode 0 (FK): Joint-by-joint angle integration published directly to /arm_cmd,
+            with continuous mirroring to /arm_fk_sync for solver warm-seeding.
+          * Mode 1 (IK): Cylindrical Cartesian control of wrist_center (end of Link 2) published to /arm_ik_cmd.
+      - Dynamic Leash Anti-Windup (25 mm limit clamp):
+          * Clamps Cartesian targets within 25 mm of the actual reached wrist position when pushing against
+            workspace boundaries, preventing the target frame from drifting away and ensuring instant reversal.
       - Bumpless Bidirectional State Synchronization:
-          * FK -> IK: Analytical 3D Forward Kinematics (URDF-derived) initializes Cartesian targets
+          * FK -> IK: Analytical 3D Forward Kinematics to wrist_center initializes Cartesian targets
             (r, theta, z, world_pitch, roll) directly from the current physical joint configuration.
           * IK -> FK: Continuously mirrors solved joint angles from /arm_joint_sync while in IK mode,
             allowing immediate and seamless resumption of joint-level control with zero jump.
@@ -112,36 +122,37 @@ class PS5Mapper(Node):
     JOINT_LIMITS = [
         (-3.14,  3.14),   # 0: Base Yaw        (±180°)
         (-1.57,  1.57),   # 1: Shoulder Pitch  (±90°)
-        (-2.50,  2.50),   # 2: Elbow Pitch     (±143.2°) — matches arm_cad.urdf.xacro
+        ( 0.00,  2.50),   # 2: Elbow Pitch     (0 to +143.2°) — prevents backward elbow bending
         (-1.57,  1.57),   # 3: Wrist Pitch     (±90°)
         (-3.14,  3.14),   # 4: Wrist Roll      (±180°)
         (-0.35,  1.57),   # 5: Gripper
     ]
 
-    # Cartesian workspace limits (min, max) in meters / radians
-    # Verified via MoveIt FK sweep against arm_cad.urdf.xacro:
-    #   Physical reach r: [0.020, 1.154] m  |  Physical elevation z: [-0.668, 1.253] m
-    # Operational limits are set with a small safety margin inside the physical extremes.
-    REACH_LIMITS       = (0.10, 1.10)   # Radial reach (m) from base to TCP
-    ELEV_LIMITS        = (-0.60, 1.20)  # Elevation (m) from base to TCP
-    AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°)
+    # Kinematic mounting constants for wrist_center relative to base_link
+    BASE_PIVOT_X       = 0.043511       # Base yaw rotation axis X (m)
+    BASE_PIVOT_Y       = -0.012448      # Base yaw rotation axis Y (m)
+    BASE_PIVOT_Z       = 0.03425        # Base yaw joint Z elevation (m)
+    ARM_LATERAL_OFFSET = -0.023         # Arm sagittal lateral offset in rotating frame (m)
+
+    # Cartesian workspace limits (min, max) in meters / radians for wrist_center (end of Link 2):
+    REACH_LIMITS       = (0.04, 0.98)   # Forward sagittal reach (m) from shoulder to wrist_center
+    ELEV_LIMITS        = (-0.45, 1.08)  # Elevation (m) from base to wrist_center
+    AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°, 0 = forward, + = CCW, - = CW)
     WORLD_PITCH_LIMITS = (-1.57, 1.57)  # World pitch (rad) relative to horizon (0=horizontal)
     ROLL_LIMITS        = (-3.14, 3.14)  # Wrist axial roll (rad) (±180°)
 
-    # Spherical workspace envelope — replaces independent r/z rectangle clamp.
+    # Spherical workspace envelope for wrist_center
     # Model: sphere centered at (r=0, z=SHOULDER_PIVOT_Z) with radius WORKSPACE_RADIUS.
-    # Derived from MoveIt FK sweep: max reach = 1.154 m, shoulder pivot height ≈ 0.20 m.
-    # Safety margin of 0.05 m inside physical max to avoid hard joint-limit singularities.
-    SHOULDER_PIVOT_Z   = 0.20           # Shoulder joint pivot height (m) above base_link
-    WORKSPACE_RADIUS   = 1.10           # Usable workspace sphere radius (m) (physical max: 1.154 m)
+    SHOULDER_PIVOT_Z   = 0.1385         # Exact shoulder joint pivot elevation (m) in base_link
+    WORKSPACE_RADIUS   = 0.98           # Spherical workspace radius (m) to wrist_center (physical max: 0.990 m)
 
-    # Initial Cartesian home state (r, theta, z, world_pitch, roll)
-    # Home posture at q=[0,0,2.0072,0,0,0]: tool0 at r=0.70m, z=0.22m (workspace center)
+    # Initial Cartesian home state (r, theta, z, world_pitch, roll) for wrist_center
+    # Home posture at q=[0,0,2.0072,0,0,0]: forward reach r=0.4775m, theta=0.0rad (forward), z=0.3315m
     HOME_CARTESIAN = {
-        'r': 0.70,
-        'theta': -1.54,
-        'z': 0.22,
-        'world_pitch': 0.0,
+        'r': 0.4775,
+        'theta': 0.0,
+        'z': 0.3315,
+        'world_pitch': -0.4363,
         'roll': 0.0
     }
 
@@ -251,6 +262,11 @@ class PS5Mapper(Node):
         # Arm position commands: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
         self.publisher = self.create_publisher(
             Float64MultiArray, 'arm_cmd', 10
+        )
+
+        # FK state sync publisher (for continuous warm-seeding of ik_solver_node during Mode 0)
+        self.fk_sync_pub = self.create_publisher(
+            Float64MultiArray, 'arm_fk_sync', 10
         )
 
         # IK target command array for IK Solver: [r, theta, z, world_pitch, roll, gripper]
@@ -389,8 +405,8 @@ class PS5Mapper(Node):
         if new_state == 1 and self.prev_mode_btn_state == 0:
             self.MODE = 1 - self.MODE
             if self.MODE == 1:
-                # Bumpless FK -> IK transition: compute Cartesian targets from current joint angles
-                r, theta, z, world_pitch, roll = self.compute_forward_kinematics(self.target_positions)
+                # Bumpless FK -> IK transition: compute Cartesian wrist targets from current joint angles
+                r, theta, z, world_pitch, roll = self.compute_wrist_fk(self.target_positions)
                 self.target_r = r
                 self.target_z = z
                 self._clamp_to_workspace_sphere()
@@ -399,7 +415,7 @@ class PS5Mapper(Node):
                 self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], roll))
                 self.get_logger().info(
                     f"Switched to IK Mode (Bumpless FK->IK sync: r={self.target_r:.3f}m, "
-                    f"theta={self.target_theta:.3f}rad, z={self.target_z:.3f}m)."
+                    f"theta={self.target_theta:.3f}rad, z={self.target_z:.3f}m, pitch={self.target_world_pitch:.3f}rad)."
                 )
             else:
                 # Bumpless IK -> FK transition: self.target_positions was continuously mirrored via /arm_joint_sync
@@ -585,6 +601,26 @@ class PS5Mapper(Node):
                         self.target_world_pitch += self.ry * self.max_world_pitch_speed * speed_mult * dt
                         self.target_roll += self.rx * self.max_roll_speed * speed_mult * dt
 
+                    # Dynamic Leash Anti-Windup against actual solved wrist position (in r, theta, z)
+                    r_act, theta_act, z_act, _, _ = self.compute_wrist_fk(self.target_positions)
+                    dr = self.target_r - r_act
+                    dz = self.target_z - z_act
+                    dtheta = self.target_theta - theta_act
+                    while dtheta > math.pi:
+                        dtheta -= 2.0 * math.pi
+                    while dtheta < -math.pi:
+                        dtheta += 2.0 * math.pi
+
+                    # Tangential lead along the arc: r * dtheta
+                    d_tangential = max(0.10, r_act) * dtheta
+                    dist_3d = math.hypot(dr, d_tangential, dz)
+                    LEASH_MAX_M = 0.025  # 25 mm max visual lead in 3D
+                    if dist_3d > LEASH_MAX_M:
+                        scale = LEASH_MAX_M / dist_3d
+                        self.target_r = r_act + dr * scale
+                        self.target_z = z_act + dz * scale
+                        self.target_theta = theta_act + dtheta * scale
+
                     # Clamp Cartesian targets to spherical workspace envelope
                     self._clamp_to_workspace_sphere()
                     self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], self.target_theta))
@@ -593,22 +629,35 @@ class PS5Mapper(Node):
                     )
                     self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], self.target_roll))
 
-                    # Compute Cartesian Coordinates (TCP / Gripper tip relative to Base)
+                    # Compute Cartesian Coordinates (wrist_center relative to base_link)
                     pose_msg = PoseStamped()
                     pose_msg.header.stamp = self.get_clock().now().to_msg()
                     pose_msg.header.frame_id = 'base_link'
-                    pose_msg.pose.position.x = self.target_r * math.cos(self.target_theta)
-                    pose_msg.pose.position.y = self.target_r * math.sin(self.target_theta)
+                    pose_msg.pose.position.x = (
+                        self.BASE_PIVOT_X
+                        + self.target_r * math.sin(self.target_theta)
+                        + self.ARM_LATERAL_OFFSET * math.cos(self.target_theta)
+                    )
+                    pose_msg.pose.position.y = (
+                        self.BASE_PIVOT_Y
+                        - self.target_r * math.cos(self.target_theta)
+                        + self.ARM_LATERAL_OFFSET * math.sin(self.target_theta)
+                    )
                     pose_msg.pose.position.z = self.target_z
 
-                    # Compute Auto-Leveling Orientation Quaternion
-                    qx, qy, qz, qw = R.from_euler(
-                        'ZYX', [self.target_theta, self.target_world_pitch, self.target_roll]
-                    ).as_quat()
-                    pose_msg.pose.orientation.x = qx
-                    pose_msg.pose.orientation.y = qy
-                    pose_msg.pose.orientation.z = qz
-                    pose_msg.pose.orientation.w = qw
+                    # Compute Auto-Leveling Orientation Quaternion matching physical tool0 frame:
+                    # R_tool0 = R_z(theta) @ R_x(-world_pitch) @ R_y(roll) @ R_z(pi)
+                    r_mat = (
+                        R.from_euler('z', self.target_theta).as_matrix()
+                        @ R.from_euler('x', -self.target_world_pitch).as_matrix()
+                        @ R.from_euler('y', self.target_roll).as_matrix()
+                        @ R.from_euler('z', np.pi).as_matrix()
+                    )
+                    qx, qy, qz, qw = R.from_matrix(r_mat).as_quat()
+                    pose_msg.pose.orientation.x = float(qx)
+                    pose_msg.pose.orientation.y = float(qy)
+                    pose_msg.pose.orientation.z = float(qz)
+                    pose_msg.pose.orientation.w = float(qw)
 
                     # Publish Cartesian Pose for visualization (RViz / MoveIt)
                     self.target_pose_pub.publish(pose_msg)
@@ -636,12 +685,13 @@ class PS5Mapper(Node):
             self.target_positions[i] = max(lo, min(hi, self.target_positions[i]))
 
         # Mode-Gated Publishing:
-        # FK Mode: ps5_mapper directly publishes [J0..J4, Gripper] to /arm_cmd
+        # FK Mode: ps5_mapper directly publishes [J0..J4, Gripper] to /arm_cmd and /arm_fk_sync
         # IK Mode: ps5_mapper published to /arm_ik_cmd above; the IK Solver will publish to /arm_cmd
         if self.MODE == 0:
             cmd_msg = Float64MultiArray()
             cmd_msg.data = list(self.target_positions)
             self.publisher.publish(cmd_msg)
+            self.fk_sync_pub.publish(cmd_msg)
 
     def watchdog_callback(self):
         """Monitors joystick heartbeat; sets signal_lost flag if communication drops."""
@@ -676,6 +726,50 @@ class PS5Mapper(Node):
         right_msg.id = 1
         right_msg.intensity = float(msg.data[1])
         self.feedback_publisher.publish(right_msg)
+
+    def compute_wrist_fk(self, joints: list[float]) -> tuple[float, float, float, float, float]:
+        """
+        Computes 3D Forward Kinematics for wrist_center (end of Link 2 / wrist pitch axis)
+        relative to base_link from joint angles.
+        Derived from link origin vectors and rotations in arm_cad.urdf.xacro.
+
+        Args:
+            joints: List of joint angles in radians [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, ...].
+
+        Returns:
+            tuple (r, theta, z, world_pitch, roll):
+              - r (float): Forward sagittal reach from shoulder to wrist_center (meters).
+              - theta (float): Base azimuth angle relative to forward (radians, 0 = forward).
+              - z (float): Vertical elevation of wrist_center relative to base_link origin (meters).
+              - world_pitch (float): Gripper pitch angle relative to the ground horizon (radians).
+              - roll (float): Wrist axial roll angle (radians).
+        """
+        q = joints
+
+        def T_mat(rot=None, trans=(0.0, 0.0, 0.0)):
+            T = np.eye(4)
+            if rot is not None:
+                T[:3, :3] = rot.as_matrix()
+            T[:3, 3] = trans
+            return T
+
+        # Transform in the arm rotating frame (q0 = 0)
+        T_arm = T_mat(trans=(0.0145, 0.0, 0.070))
+        T_arm = T_arm @ T_mat(R.from_euler('x', q[1])) @ T_mat(trans=(-0.038, 0.0, 0.450))
+        T_arm = T_arm @ T_mat(R.from_euler('x', -2.00719)) @ T_mat(R.from_euler('x', q[2]))
+        T_arm = T_arm @ T_mat(trans=(0.0005, -0.47751, -0.222701))
+        p_arm = T_arm[:3, 3]
+
+        # Forward sagittal reach (arm extends along -Y in rotating frame)
+        r = float(-p_arm[1])
+        # Elevation relative to base_link origin
+        z = float(self.BASE_PIVOT_Z + p_arm[2])
+        # Base azimuth angle is directly q[0]
+        theta = float(q[0])
+        # Gripper pitch relative to ground horizon
+        world_pitch = float(-(q[1] + q[2] - 2.00719 + q[3] + 0.4363323))
+        roll = float(q[4])
+        return r, theta, z, world_pitch, roll
 
     def compute_forward_kinematics(self, joints: list[float]) -> tuple[float, float, float, float, float]:
         """
@@ -713,8 +807,8 @@ class PS5Mapper(Node):
         px, py, pz = T[:3, 3]
         r = float(np.hypot(px, py))
         theta = float(np.arctan2(py, px))
-        # Elbow offset of -2.00719 rad must be subtracted (q[2]=0 = straight, not bent)
-        world_pitch = float(q[1] + q[2] + q[3] - 2.00719)
+        # Total sagittal pitch includes shoulder, elbow (-2.00719 offset), wrist_pitch, and 0.4363323 bevel offset
+        world_pitch = float(-(q[1] + q[2] - 2.00719 + q[3] + 0.4363323))
         roll = float(q[4])
         return r, theta, float(pz), world_pitch, roll
 
