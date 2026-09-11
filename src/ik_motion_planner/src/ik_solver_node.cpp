@@ -44,6 +44,21 @@ public:
     }
     use_live_joint_states_ = this->get_parameter("use_live_joint_states").as_bool();
 
+    if (!this->has_parameter("wrist_planning_group")) {
+      this->declare_parameter<std::string>("wrist_planning_group", "arm_wrist");
+    }
+    wrist_planning_group_ = this->get_parameter("wrist_planning_group").as_string();
+
+    if (!this->has_parameter("wrist_tip_frame")) {
+      this->declare_parameter<std::string>("wrist_tip_frame", "wrist_center");
+    }
+    wrist_tip_frame_ = this->get_parameter("wrist_tip_frame").as_string();
+
+    if (!this->has_parameter("cartesian_tolerance_m")) {
+      this->declare_parameter<double>("cartesian_tolerance_m", 0.010);
+    }
+    cartesian_tolerance_m_ = this->get_parameter("cartesian_tolerance_m").as_double();
+
     joint_names_ = {
       "base_yaw_joint",
       "shoulder_joint",
@@ -69,6 +84,11 @@ public:
     ik_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
       "arm_ik_cmd", 10,
       std::bind(&IKSolverNode::ikCmdCallback, this, std::placeholders::_1));
+
+    // Continuous FK state synchronization from ps5_mapper (for bumpless FK -> IK warm seeding)
+    fk_sync_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+      "arm_fk_sync", 10,
+      std::bind(&IKSolverNode::fkSyncCallback, this, std::placeholders::_1));
 
     // Live joint feedback subscription (hook for future closed-loop seeding)
     joint_feedback_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
@@ -110,46 +130,47 @@ public:
       RCLCPP_WARN(this->get_logger(), "No custom kinematics solver loaded; using default MoveIt IK.");
     }
 
-    const Eigen::Isometry3d & home_pose = kinematic_state_->getGlobalLinkTransform(tip_frame_);
+    // Load decoupled wrist positioning group (e.g. arm_wrist targeting wrist_center)
+    joint_model_group_wrist_ = kinematic_model_->getJointModelGroup(wrist_planning_group_);
+    if (joint_model_group_wrist_) {
+      RCLCPP_INFO(this->get_logger(), "Decoupled wrist positioning group '%s' (tip: '%s') loaded.",
+        wrist_planning_group_.c_str(), wrist_tip_frame_.c_str());
+    } else {
+      RCLCPP_WARN(this->get_logger(), "Group '%s' not found; falling back to group '%s'.",
+        wrist_planning_group_.c_str(), planning_group_.c_str());
+    }
+
+    const Eigen::Isometry3d & home_pose = kinematic_state_->getGlobalLinkTransform(wrist_tip_frame_);
     RCLCPP_INFO(this->get_logger(), "Home '%s' Pose (all joints=0): x=%.3f y=%.3f z=%.3f  r=%.3f  theta=%.3f rad",
-      tip_frame_.c_str(),
+      wrist_tip_frame_.c_str(),
       home_pose.translation().x(), home_pose.translation().y(), home_pose.translation().z(),
       std::hypot(home_pose.translation().x(), home_pose.translation().y()),
       std::atan2(home_pose.translation().y(), home_pose.translation().x()));
 
-    // ---- FK Workspace Sweep using MoveIt RobotState ----
-    // Compute actual bounds by evaluating key joint configurations.
-    // No KDL needed — uses the same MoveIt model already loaded for TRAC-IK.
+    // ---- FK Workspace Sweep using MoveIt RobotState for wrist_center ----
     auto sweep_state = std::make_shared<moveit::core::RobotState>(kinematic_model_);
     double r_min = 1e9, r_max = -1e9, z_min = 1e9, z_max = -1e9;
 
-    // Joint limits (from URDF):
-    // shoulder: [-1.57, 1.57], elbow: [-2.50, 2.50], wrist_pitch: [-1.57, 1.57]
-    // base_yaw and wrist_roll don't change TCP position (only azimuth/orientation), so fix at 0
+    // Joint limits (from URDF): shoulder: [-1.57, 1.57], elbow: [0.0, 2.50]
     std::vector<double> shoulder_vals = {-1.57, -1.0, -0.5, 0.0, 0.5, 1.0, 1.57};
-    std::vector<double> elbow_vals    = {-2.50, -1.5, -0.5, 0.0, 0.5, 1.5, 2.50};
-    std::vector<double> wrist_vals    = {-1.57, 0.0, 1.57};
+    std::vector<double> elbow_vals    = {0.0, 0.5, 1.0, 1.5, 2.0, 2.50};
 
     for (double q2 : shoulder_vals) {
       for (double q3 : elbow_vals) {
-        for (double q4 : wrist_vals) {
-          sweep_state->setVariablePosition("base_yaw_joint",    0.0);
-          sweep_state->setVariablePosition("shoulder_joint",     q2);
-          sweep_state->setVariablePosition("elbow_joint",        q3);
-          sweep_state->setVariablePosition("wrist_pitch_joint",  q4);
-          sweep_state->setVariablePosition("wrist_roll_joint",   0.0);
-          sweep_state->update();
-          const Eigen::Vector3d & p = sweep_state->getGlobalLinkTransform(tip_frame_).translation();
-          double r = std::hypot(p.x(), p.y());
-          r_min = std::min(r_min, r);
-          r_max = std::max(r_max, r);
-          z_min = std::min(z_min, p.z());
-          z_max = std::max(z_max, p.z());
-        }
+        sweep_state->setVariablePosition("base_yaw_joint",    0.0);
+        sweep_state->setVariablePosition("shoulder_joint",     q2);
+        sweep_state->setVariablePosition("elbow_joint",        q3);
+        sweep_state->update();
+        const Eigen::Vector3d & p = sweep_state->getGlobalLinkTransform(wrist_tip_frame_).translation();
+        double r = std::hypot(p.x(), p.y());
+        r_min = std::min(r_min, r);
+        r_max = std::max(r_max, r);
+        z_min = std::min(z_min, p.z());
+        z_max = std::max(z_max, p.z());
       }
     }
     RCLCPP_INFO(this->get_logger(),
-      "FK Workspace Bounds (base_yaw=0): Reach r=[%.3f, %.3f] m  |  Elevation z=[%.3f, %.3f] m",
+      "FK Wrist Workspace Bounds (base_yaw=0): Reach r=[%.3f, %.3f] m  |  Elevation z=[%.3f, %.3f] m",
       r_min, r_max, z_min, z_max);
     RCLCPP_INFO(this->get_logger(),
       "Azimuth theta=[-3.14, +3.14] rad (full 360 deg via base_yaw_joint)");
@@ -207,44 +228,116 @@ private:
     double gripper_cmd = msg->data[5];
     last_gripper_val_ = gripper_cmd;
 
-    // 1. Reconstruct Cartesian target coordinates
-    geometry_msgs::msg::Pose target_pose;
-    target_pose.position.x = r * std::cos(theta);
-    target_pose.position.y = r * std::sin(theta);
-    target_pose.position.z = z;
+    // Target wrist_center Cartesian position in base_link frame
+    const double X0 = 0.043511;
+    const double Y0 = -0.012448;
+    const double dx_arm = -0.023;
 
-    // 2. Reconstruct Auto-Leveling Orientation (matching mapper)
-    double qx, qy, qz, qw;
-    eulerToQuaternion(theta, world_pitch, roll, qx, qy, qz, qw);
-    target_pose.orientation.x = qx;
-    target_pose.orientation.y = qy;
-    target_pose.orientation.z = qz;
-    target_pose.orientation.w = qw;
+    double x_w_base = X0 + r * std::sin(theta) + dx_arm * std::cos(theta);
+    double y_w_base = Y0 - r * std::cos(theta) + dx_arm * std::sin(theta);
+    double z_w_base = z;
 
-    // 3. Seed kinematic state with current joint angles (open-loop seed tracking)
+    // Update kinematic_state_ with current arm joints so p_cur reflects current physical posture
     for (size_t i = 0; i < joint_names_.size(); ++i) {
       kinematic_state_->setVariablePosition(joint_names_[i], current_arm_joints_[i]);
     }
+    kinematic_state_->update();
+    Eigen::Isometry3d T_root_base = kinematic_state_->getFrameTransform(base_frame_);
+    Eigen::Vector3d pw_in_root = T_root_base * Eigen::Vector3d(x_w_base, y_w_base, z_w_base);
 
-    // 4. Solve Inverse Kinematics using MoveIt (TRAC-IK / KDL plugin)
-    bool found_ik = kinematic_state_->setFromIK(
-      joint_model_group_, target_pose, tip_frame_, ik_timeout_);
+    // If current wrist position is already within 0.5 mm of the target (e.g. at rest or on mode switch),
+    // retain current positioning joints to prevent solver chatter / numerical SQP tolerance drift.
+    const Eigen::Vector3d & p_cur = kinematic_state_->getGlobalLinkTransform(wrist_tip_frame_).translation();
+    double target_dist = (p_cur - pw_in_root).norm();
 
-    if (found_ik) {
-      // Extract solved joint positions in correct hardware joint order
-      for (size_t i = 0; i < joint_names_.size(); ++i) {
-        current_arm_joints_[i] = kinematic_state_->getVariablePosition(joint_names_[i]);
-      }
+    if (target_dist < 0.0005) {
+      double cand_q1 = current_arm_joints_[1];
+      double cand_q2 = current_arm_joints_[2];
+      double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
+      current_arm_joints_[3] = std::max(-1.57, std::min(1.57, cand_q3_analytical));
+      current_arm_joints_[4] = std::max(-3.14, std::min(3.14, roll));
       has_valid_solution_ = true;
     } else {
-      // Failure Handling per agreed specification:
-      // Hold last valid joint angles to suppress discontinuous jumps; log throttled warning
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
-        "IK solver could not find a solution for target (r=%.2f, th=%.2f, z=%.2f). Holding position.",
-        r, theta, z);
+      geometry_msgs::msg::Pose wrist_target_pose;
+      wrist_target_pose.position.x = pw_in_root.x();
+      wrist_target_pose.position.y = pw_in_root.y();
+      wrist_target_pose.position.z = pw_in_root.z();
+      wrist_target_pose.orientation.w = 1.0; // position_only_ik
+
+      // Seed TRAC-IK with commanded base yaw theta, and current arm joints
+      kinematic_state_->setVariablePosition(joint_names_[0], theta);
+      kinematic_state_->setVariablePosition(joint_names_[1], current_arm_joints_[1]);
+      kinematic_state_->setVariablePosition(joint_names_[2], current_arm_joints_[2]);
+
+      const auto* jmg_to_solve = joint_model_group_wrist_ ? joint_model_group_wrist_ : joint_model_group_;
+      const std::string& tip_to_solve = joint_model_group_wrist_ ? wrist_tip_frame_ : tip_frame_;
+
+      bool ik_ok = kinematic_state_->setFromIK(
+        jmg_to_solve, wrist_target_pose, tip_to_solve, ik_timeout_);
+
+      if (ik_ok) {
+        double cand_q0 = kinematic_state_->getVariablePosition(joint_names_[0]);
+        double cand_q1 = kinematic_state_->getVariablePosition(joint_names_[1]);
+        double cand_q2 = kinematic_state_->getVariablePosition(joint_names_[2]);
+
+        // Base Yaw Azimuth Guard:
+        // Expected base yaw is theta. Solutions that flip 180 degrees backward (|yaw_diff| > 1.0 rad)
+        // or jump suddenly are rejected.
+        double q0_exp = theta;
+        while (q0_exp > M_PI) q0_exp -= 2.0 * M_PI;
+        while (q0_exp < -M_PI) q0_exp += 2.0 * M_PI;
+
+        double yaw_diff = cand_q0 - q0_exp;
+        while (yaw_diff > M_PI) yaw_diff -= 2.0 * M_PI;
+        while (yaw_diff < -M_PI) yaw_diff += 2.0 * M_PI;
+
+        double yaw_jump = cand_q0 - current_arm_joints_[0];
+        while (yaw_jump > M_PI) yaw_jump -= 2.0 * M_PI;
+        while (yaw_jump < -M_PI) yaw_jump += 2.0 * M_PI;
+
+        if (std::abs(yaw_diff) > 1.0 || std::abs(yaw_jump) > 1.0) {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "[YAW GUARD] Rejected base yaw flip (cand=%.2f, exp=%.2f, diff=%.2f, jump=%.2f). Holding position.",
+            cand_q0, q0_exp, yaw_diff, yaw_jump);
+        } else {
+          // Analytical wrist pitch strictly enforcing world_pitch relative to horizon:
+          double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
+          double cand_q3 = std::max(-1.57, std::min(1.57, cand_q3_analytical));
+          double cand_q4 = std::max(-3.14, std::min(3.14, roll));
+
+          current_arm_joints_[0] = cand_q0;
+          current_arm_joints_[1] = cand_q1;
+          current_arm_joints_[2] = cand_q2;
+          current_arm_joints_[3] = cand_q3;
+          current_arm_joints_[4] = cand_q4;
+          has_valid_solution_ = true;
+        }
+      } else {
+        // When TRAC-IK fails (e.g. pushed against minimum reach or elevation boundary),
+        // the base yaw joint is completely decoupled from the sagittal reach and can still rotate!
+        // Update base_yaw to theta within limits, and recompute analytical wrist orientation.
+        double cand_q0 = std::max(-3.14, std::min(3.14, theta));
+        double yaw_jump = cand_q0 - current_arm_joints_[0];
+        while (yaw_jump > M_PI) yaw_jump -= 2.0 * M_PI;
+        while (yaw_jump < -M_PI) yaw_jump += 2.0 * M_PI;
+
+        if (std::abs(yaw_jump) <= 1.0) {
+          current_arm_joints_[0] = cand_q0;
+          double cand_q1 = current_arm_joints_[1];
+          double cand_q2 = current_arm_joints_[2];
+          double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
+          current_arm_joints_[3] = std::max(-1.57, std::min(1.57, cand_q3_analytical));
+          current_arm_joints_[4] = std::max(-3.14, std::min(3.14, roll));
+          has_valid_solution_ = true;
+        } else {
+          RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+            "IK solver could not find a solution for wrist target (r=%.2f, th=%.2f, z=%.2f). Holding position.",
+            r, theta, z);
+        }
+      }
     }
 
-    // 5. Publish unified /arm_cmd [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
+    // Publish unified /arm_cmd [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
     std_msgs::msg::Float64MultiArray cmd_msg;
     cmd_msg.data.reserve(6);
     for (double j_val : current_arm_joints_) {
@@ -253,6 +346,18 @@ private:
     cmd_msg.data.push_back(last_gripper_val_);
     arm_cmd_pub_->publish(cmd_msg);
     joint_sync_pub_->publish(cmd_msg);
+  }
+
+  void fkSyncCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+  {
+    if (msg->data.size() >= 5) {
+      for (size_t i = 0; i < 5; ++i) {
+        current_arm_joints_[i] = msg->data[i];
+      }
+    }
+    if (msg->data.size() >= 6) {
+      last_gripper_val_ = msg->data[5];
+    }
   }
 
   /**
@@ -280,7 +385,10 @@ private:
   std::string planning_group_;
   std::string base_frame_;
   std::string tip_frame_;
+  std::string wrist_planning_group_;
+  std::string wrist_tip_frame_;
   double ik_timeout_;
+  double cartesian_tolerance_m_{0.010};
   bool use_live_joint_states_;
 
   std::vector<std::string> joint_names_;
@@ -291,11 +399,13 @@ private:
   std::shared_ptr<robot_model_loader::RobotModelLoader> robot_model_loader_;
   moveit::core::RobotModelPtr kinematic_model_;
   const moveit::core::JointModelGroup* joint_model_group_{nullptr};
+  const moveit::core::JointModelGroup* joint_model_group_wrist_{nullptr};
   moveit::core::RobotStatePtr kinematic_state_;
 
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr arm_cmd_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr joint_sync_pub_;
   rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr ik_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr fk_sync_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_feedback_sub_;
 };
 
