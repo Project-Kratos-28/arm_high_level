@@ -206,6 +206,10 @@ class PS5Mapper(Node):
         self.max_wrist_speed = self.get_parameter('max_wrist_speed').value
         self.max_gripper_speed = self.get_parameter('max_gripper_speed').value
 
+        # Cached read-only parameters (constant throughout node lifetime)
+        self.deadzone = self.get_parameter('deadzone').value
+        self.precision_scale = self.get_parameter('precision_scale').value
+
         # Dynamic runtime Cartesian max speed values
         self.max_reach_speed = self.get_parameter('max_reach_speed').value
         self.max_elev_speed = self.get_parameter('max_elev_speed').value
@@ -298,7 +302,7 @@ class PS5Mapper(Node):
     def apply_deadzone(self, value: float, threshold: float = None) -> float:
         """Applies a standard deadzone filter to an axis value."""
         if threshold is None:
-            threshold = self.get_parameter('deadzone').value
+            threshold = self.deadzone
         return value if abs(value) > threshold else 0.0
 
     def get_trigger_value(self, raw_axis_val: float) -> float:
@@ -307,8 +311,7 @@ class PS5Mapper(Node):
         to [0.0, 1.0] (0.0=unpressed, 1.0=fully pressed).
         """
         normalized = (1.0 - raw_axis_val) / 2.0
-        deadzone = self.get_parameter('deadzone').value
-        if normalized <= deadzone:
+        if normalized <= self.deadzone:
             return 0.0
         return min(1.0, normalized)
 
@@ -543,7 +546,7 @@ class PS5Mapper(Node):
         self.prev_lt_active = False
 
         # 6. Record stick axes and bumper states
-        deadzone = self.get_parameter('deadzone').value
+        deadzone = self.deadzone
         self.lb_held = bool(msg.buttons[self.LB])
         self.rb_held = bool(msg.buttons[self.RB])
 
@@ -576,7 +579,7 @@ class PS5Mapper(Node):
           - Gripper integration runs across both modes (D-Pad Left = Open, D-Pad Right = Close).
         """
         dt = self.DT
-        speed_mult = self.get_parameter('precision_scale').value if self.lb_held else 1.0
+        speed_mult = self.precision_scale if self.lb_held else 1.0
 
         # Freeze position increments if E-Stop or signal lost
         if not (self.e_stop_active or self.signal_lost):
