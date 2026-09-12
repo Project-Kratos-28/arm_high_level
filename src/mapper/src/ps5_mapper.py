@@ -781,48 +781,6 @@ class PS5Mapper(Node):
         roll = float(q[4])
         return r, theta, z, world_pitch, roll
 
-    def compute_forward_kinematics(self, joints: list[float]) -> tuple[float, float, float, float, float]:
-        """
-        Computes 3D Forward Kinematics for tool0 relative to base_link from joint angles.
-        Derived from link origin vectors and rotations in arm_cad.urdf.xacro.
-
-        Args:
-            joints: List of joint angles in radians [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, ...].
-
-        Returns:
-            tuple (r, theta, z, world_pitch, roll):
-              - r (float): Radial reach from base to tool0 in horizontal XY plane (meters).
-              - theta (float): Base azimuth angle in base_link frame (radians).
-              - z (float): Vertical elevation of tool0 relative to base_link origin (meters).
-              - world_pitch (float): Gripper pitch angle relative to the ground horizon (radians).
-              - roll (float): Wrist axial roll angle (radians).
-        """
-        q = joints
-
-        def T_mat(rot=None, trans=(0.0, 0.0, 0.0)):
-            T = np.eye(4)
-            if rot is not None:
-                T[:3, :3] = rot.as_matrix()
-            T[:3, 3] = trans
-            return T
-
-        # Chain 4x4 link transforms across the arm joints
-        T = T_mat(trans=(0.043511, -0.012448, 0.03425)) @ T_mat(R.from_euler('z', q[0])) @ T_mat(trans=(0.0145, 0.0, 0.070))
-        T = T @ T_mat(R.from_euler('x', q[1])) @ T_mat(trans=(-0.038, 0.0, 0.450))
-        # Elbow joint origin rpy="-2.00719 0 0" (makes q[2]=0 the straight-arm reference)
-        T = T @ T_mat(R.from_euler('x', -2.00719)) @ T_mat(R.from_euler('x', q[2])) @ T_mat(trans=(0.0005, -0.47751, -0.22270))
-        T = T @ T_mat(R.from_euler('x', q[3])) @ T_mat(trans=(0.0, -0.01722, -0.00803)) @ T_mat(R.from_euler('x', 0.4363323))
-        T = T @ T_mat(R.from_euler('y', q[4])) @ T_mat(trans=(0.0, -0.043, 0.007)) @ T_mat(R.from_euler('z', np.pi)) @ T_mat(trans=(0.0, 0.175, -0.015))
-
-        px, py, pz = T[:3, 3]
-        r = float(np.hypot(px, py))
-        theta = float(np.arctan2(py, px))
-        # Total sagittal pitch includes shoulder, elbow (-2.00719 offset), wrist_pitch, and 0.4363323 bevel offset
-        world_pitch = float(-(q[1] + q[2] - 2.00719 + q[3] + 0.4363323))
-        roll = float(q[4])
-        return r, theta, float(pz), world_pitch, roll
-
-
 def main(args=None):
     rclpy.init(args=args)
     node = PS5Mapper()
