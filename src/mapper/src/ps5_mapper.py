@@ -145,6 +145,7 @@ class PS5Mapper(Node):
     # Model: sphere centered at (r=0, z=SHOULDER_PIVOT_Z) with radius WORKSPACE_RADIUS.
     SHOULDER_PIVOT_Z   = 0.1385         # Exact shoulder joint pivot elevation (m) in base_link
     WORKSPACE_RADIUS   = 0.98           # Spherical workspace radius (m) to wrist_center (physical max: 0.990 m)
+    LEASH_MAX_M        = 0.025          # 25 mm max visual lead in 3D (dynamic leash anti-windup)
 
     # Initial Cartesian home state (r, theta, z, world_pitch, roll) for wrist_center
     # Home posture at q=[0,0,2.0072,0,0,0]: forward reach r=0.4775m, theta=0.0rad (forward), z=0.3315m
@@ -623,9 +624,8 @@ class PS5Mapper(Node):
                     # Tangential lead along the arc: r * dtheta
                     d_tangential = max(0.10, r_act) * dtheta
                     dist_3d = math.hypot(dr, d_tangential, dz)
-                    LEASH_MAX_M = 0.025  # 25 mm max visual lead in 3D
-                    if dist_3d > LEASH_MAX_M:
-                        scale = LEASH_MAX_M / dist_3d
+                    if dist_3d > self.LEASH_MAX_M:
+                        scale = self.LEASH_MAX_M / dist_3d
                         self.target_r = r_act + dr * scale
                         self.target_z = z_act + dz * scale
                         self.target_theta = theta_act + dtheta * scale
