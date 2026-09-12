@@ -12,6 +12,18 @@
 #include <moveit/robot_model/robot_model.hpp>
 #include <moveit/robot_state/robot_state.hpp>
 
+static inline double wrapAngle(double a)
+{
+  while (a > M_PI) a -= 2.0 * M_PI;
+  while (a < -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+
+static inline double analyticalWristPitch(double world_pitch, double q1, double q2)
+{
+  return -world_pitch - (q1 + q2 - 2.00719 + 0.4363323);
+}
+
 class IKSolverNode : public rclcpp::Node
 {
 public:
@@ -225,9 +237,7 @@ private:
     double target_dist = (p_cur - pw_in_root).norm();
 
     if (target_dist < 0.0005) {
-      double cand_q1 = current_arm_joints_[1];
-      double cand_q2 = current_arm_joints_[2];
-      double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
+      double cand_q3_analytical = analyticalWristPitch(world_pitch, current_arm_joints_[1], current_arm_joints_[2]);
       current_arm_joints_[3] = std::max(-1.57, std::min(1.57, cand_q3_analytical));
       current_arm_joints_[4] = std::max(-3.14, std::min(3.14, roll));
     } else {
@@ -256,17 +266,9 @@ private:
         // Base Yaw Azimuth Guard:
         // Expected base yaw is theta. Solutions that flip 180 degrees backward (|yaw_diff| > 1.0 rad)
         // or jump suddenly are rejected.
-        double q0_exp = theta;
-        while (q0_exp > M_PI) q0_exp -= 2.0 * M_PI;
-        while (q0_exp < -M_PI) q0_exp += 2.0 * M_PI;
-
-        double yaw_diff = cand_q0 - q0_exp;
-        while (yaw_diff > M_PI) yaw_diff -= 2.0 * M_PI;
-        while (yaw_diff < -M_PI) yaw_diff += 2.0 * M_PI;
-
-        double yaw_jump = cand_q0 - current_arm_joints_[0];
-        while (yaw_jump > M_PI) yaw_jump -= 2.0 * M_PI;
-        while (yaw_jump < -M_PI) yaw_jump += 2.0 * M_PI;
+        double q0_exp = wrapAngle(theta);
+        double yaw_diff = wrapAngle(cand_q0 - q0_exp);
+        double yaw_jump = wrapAngle(cand_q0 - current_arm_joints_[0]);
 
         if (std::abs(yaw_diff) > 1.0 || std::abs(yaw_jump) > 1.0) {
           RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
@@ -274,7 +276,7 @@ private:
             cand_q0, q0_exp, yaw_diff, yaw_jump);
         } else {
           // Analytical wrist pitch strictly enforcing world_pitch relative to horizon:
-          double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
+          double cand_q3_analytical = analyticalWristPitch(world_pitch, cand_q1, cand_q2);
           double cand_q3 = std::max(-1.57, std::min(1.57, cand_q3_analytical));
           double cand_q4 = std::max(-3.14, std::min(3.14, roll));
 
@@ -289,15 +291,11 @@ private:
         // the base yaw joint is completely decoupled from the sagittal reach and can still rotate!
         // Update base_yaw to theta within limits, and recompute analytical wrist orientation.
         double cand_q0 = std::max(-3.14, std::min(3.14, theta));
-        double yaw_jump = cand_q0 - current_arm_joints_[0];
-        while (yaw_jump > M_PI) yaw_jump -= 2.0 * M_PI;
-        while (yaw_jump < -M_PI) yaw_jump += 2.0 * M_PI;
+        double yaw_jump = wrapAngle(cand_q0 - current_arm_joints_[0]);
 
         if (std::abs(yaw_jump) <= 1.0) {
           current_arm_joints_[0] = cand_q0;
-          double cand_q1 = current_arm_joints_[1];
-          double cand_q2 = current_arm_joints_[2];
-          double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
+          double cand_q3_analytical = analyticalWristPitch(world_pitch, current_arm_joints_[1], current_arm_joints_[2]);
           current_arm_joints_[3] = std::max(-1.57, std::min(1.57, cand_q3_analytical));
           current_arm_joints_[4] = std::max(-3.14, std::min(3.14, roll));
         } else {
@@ -310,10 +308,7 @@ private:
 
     // Publish unified /arm_cmd [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
     std_msgs::msg::Float64MultiArray cmd_msg;
-    cmd_msg.data.reserve(6);
-    for (double j_val : current_arm_joints_) {
-      cmd_msg.data.push_back(j_val);
-    }
+    cmd_msg.data = current_arm_joints_;
     cmd_msg.data.push_back(last_gripper_val_);
     arm_cmd_pub_->publish(cmd_msg);
     joint_sync_pub_->publish(cmd_msg);
