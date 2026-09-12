@@ -191,26 +191,6 @@ public:
   }
 
 private:
-  /**
-   * Euler to quaternion conversion (intrinsic Z-Y-X sequence: yaw -> pitch -> roll)
-   * Matches ps5_mapper.py exactly.
-   */
-  void eulerToQuaternion(double yaw, double pitch, double roll,
-                         double & qx, double & qy, double & qz, double & qw) const
-  {
-    double cy = std::cos(yaw * 0.5);
-    double sy = std::sin(yaw * 0.5);
-    double cp = std::cos(pitch * 0.5);
-    double sp = std::sin(pitch * 0.5);
-    double cr = std::cos(roll * 0.5);
-    double sr = std::sin(roll * 0.5);
-
-    qw = cr * cp * cy + sr * sp * sy;
-    qx = sr * cp * cy - cr * sp * sy;
-    qy = cr * sp * cy + sr * cp * sy;
-    qz = cr * cp * sy - sr * sp * cy;
-  }
-
   void ikCmdCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
   {
     // Expected format: [r, theta, z, world_pitch, roll, gripper]
