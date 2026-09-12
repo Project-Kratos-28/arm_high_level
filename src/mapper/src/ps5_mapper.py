@@ -49,6 +49,15 @@ class StickAxisLock:
             return (x if abs_x > deadzone else 0.0), 0.0
 
 
+def _t_mat(rot=None, trans=(0.0, 0.0, 0.0)):
+    """Constructs a 4x4 homogeneous transformation matrix."""
+    T = np.eye(4)
+    if rot is not None:
+        T[:3, :3] = rot.as_matrix()
+    T[:3, 3] = trans
+    return T
+
+
 class PS5Mapper(Node):
     """
     ROS 2 teleoperation node for PS5 DualSense controller mapping to /arm_cmd (joint commands),
@@ -209,6 +218,11 @@ class PS5Mapper(Node):
         # Cached read-only parameters (constant throughout node lifetime)
         self.deadzone = self.get_parameter('deadzone').value
         self.precision_scale = self.get_parameter('precision_scale').value
+        self.trim_min_bound = self.get_parameter('trim_min_bound').value
+        self.trim_max_bound = self.get_parameter('trim_max_bound').value
+        self.speed_step = self.get_parameter('speed_step').value
+        self.axis_lock_enabled = self.get_parameter('axis_lock_enabled').value
+        self.watchdog_timeout = self.get_parameter('watchdog_timeout').value
 
         # Dynamic runtime Cartesian max speed values
         self.max_reach_speed = self.get_parameter('max_reach_speed').value
@@ -453,9 +467,9 @@ class PS5Mapper(Node):
         dpad_up = (dpad_y > 0.5)
         dpad_down = (dpad_y < -0.5)
 
-        step = self.get_parameter('speed_step').value
-        min_s = self.get_parameter('trim_min_bound').value
-        max_s = self.get_parameter('trim_max_bound').value
+        step = self.speed_step
+        min_s = self.trim_min_bound
+        max_s = self.trim_max_bound
         now_sec = self.get_clock().now().nanoseconds / 1e9
 
         grip_delta = 0.0
@@ -550,7 +564,7 @@ class PS5Mapper(Node):
         self.lb_held = bool(msg.buttons[self.LB])
         self.rb_held = bool(msg.buttons[self.RB])
 
-        if self.get_parameter('axis_lock_enabled').value:
+        if self.axis_lock_enabled:
             self.lx, self.ly = self.left_stick_lock.filter(msg.axes[self.LJOY_X], msg.axes[self.LJOY_Y], deadzone)
         else:
             self.lx = self.apply_deadzone(msg.axes[self.LJOY_X], deadzone)
@@ -588,15 +602,14 @@ class PS5Mapper(Node):
             if not self.is_tuning_speed:
                 if self.MODE == 0:
                     # --- FK Mode: Joint Position Integration ---
+                    self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
+                    self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
+
                     if not self.rb_held:
                         # Default Reach Mode: Right Stick Y controls Elbow
-                        self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
-                        self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
                         self.target_positions[2] += self.ry * self.max_elbow_speed * speed_mult * dt     # Elbow Pitch
                     else:
                         # Wrist Gimbal Mode (RB held): Right Stick controls Wrist Pitch (Y) & Roll (X)
-                        self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
-                        self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
                         self.target_positions[3] += self.ry * self.max_wrist_speed * speed_mult * dt     # Wrist Pitch
                         self.target_positions[4] += self.rx * self.max_wrist_speed * speed_mult * dt     # Wrist Roll
 
@@ -712,7 +725,7 @@ class PS5Mapper(Node):
             return
 
         elapsed_sec = (self.get_clock().now() - self.last_joy_time).nanoseconds / 1e9
-        timeout = self.get_parameter('watchdog_timeout').value
+        timeout = self.watchdog_timeout
 
         if elapsed_sec > timeout and not self.signal_lost:
             self.signal_lost = True
@@ -728,17 +741,13 @@ class PS5Mapper(Node):
         is_gripping = bool(msg.data[1])
         self.get_logger().info(f"Gripper Feedback: {'Gripping' if is_gripping else 'Not Gripping'}")
 
-        left_msg = JoyFeedback()
-        left_msg.type = JoyFeedback.TYPE_RUMBLE
-        left_msg.id = 0
-        left_msg.intensity = float(msg.data[1])
-        self.feedback_publisher.publish(left_msg)
-
-        right_msg = JoyFeedback()
-        right_msg.type = JoyFeedback.TYPE_RUMBLE
-        right_msg.id = 1
-        right_msg.intensity = float(msg.data[1])
-        self.feedback_publisher.publish(right_msg)
+        intensity = float(msg.data[1])
+        for rumble_id in (0, 1):
+            fb = JoyFeedback()
+            fb.type = JoyFeedback.TYPE_RUMBLE
+            fb.id = rumble_id
+            fb.intensity = intensity
+            self.feedback_publisher.publish(fb)
 
     def compute_wrist_fk(self, joints: list[float]) -> tuple[float, float, float, float, float]:
         """
@@ -759,18 +768,11 @@ class PS5Mapper(Node):
         """
         q = joints
 
-        def T_mat(rot=None, trans=(0.0, 0.0, 0.0)):
-            T = np.eye(4)
-            if rot is not None:
-                T[:3, :3] = rot.as_matrix()
-            T[:3, 3] = trans
-            return T
-
         # Transform in the arm rotating frame (q0 = 0)
-        T_arm = T_mat(trans=(0.0145, 0.0, 0.070))
-        T_arm = T_arm @ T_mat(R.from_euler('x', q[1])) @ T_mat(trans=(-0.038, 0.0, 0.450))
-        T_arm = T_arm @ T_mat(R.from_euler('x', -2.00719)) @ T_mat(R.from_euler('x', q[2]))
-        T_arm = T_arm @ T_mat(trans=(0.0005, -0.47751, -0.222701))
+        T_arm = _t_mat(trans=(0.0145, 0.0, 0.070))
+        T_arm = T_arm @ _t_mat(R.from_euler('x', q[1])) @ _t_mat(trans=(-0.038, 0.0, 0.450))
+        T_arm = T_arm @ _t_mat(R.from_euler('x', -2.00719)) @ _t_mat(R.from_euler('x', q[2]))
+        T_arm = T_arm @ _t_mat(trans=(0.0005, -0.47751, -0.222701))
         p_arm = T_arm[:3, 3]
 
         # Forward sagittal reach (arm extends along -Y in rotating frame)
