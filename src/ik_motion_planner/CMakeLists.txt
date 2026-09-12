@@ -24,28 +24,36 @@ ament_target_dependencies(ik_solver_node
   moveit_ros_planning
 )
 
-add_executable(trac_ik_benchmark src/trac_ik_benchmark.cpp)
-ament_target_dependencies(trac_ik_benchmark
-  rclcpp
-  geometry_msgs
-  moveit_core
-  moveit_ros_planning
-)
-
-add_executable(fk_ik_reachability_checker src/fk_ik_reachability_checker.cpp)
-ament_target_dependencies(fk_ik_reachability_checker
-  rclcpp
-  geometry_msgs
-  moveit_core
-  moveit_ros_planning
-)
-
 install(TARGETS
   ik_solver_node
-  trac_ik_benchmark
-  fk_ik_reachability_checker
   DESTINATION lib/${PROJECT_NAME}
 )
+
+option(BUILD_DEV_TOOLS "Build benchmark and reachability analysis tools" OFF)
+
+if(BUILD_DEV_TOOLS)
+  add_executable(trac_ik_benchmark tools/trac_ik_benchmark.cpp)
+  ament_target_dependencies(trac_ik_benchmark
+    rclcpp
+    geometry_msgs
+    moveit_core
+    moveit_ros_planning
+  )
+
+  add_executable(fk_ik_reachability_checker tools/fk_ik_reachability_checker.cpp)
+  ament_target_dependencies(fk_ik_reachability_checker
+    rclcpp
+    geometry_msgs
+    moveit_core
+    moveit_ros_planning
+  )
+
+  install(TARGETS
+    trac_ik_benchmark
+    fk_ik_reachability_checker
+    DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
 
 install(
   DIRECTORY launch
