@@ -70,7 +70,6 @@ public:
     // Seed warm-start at home posture so first IK query converges near home
     current_arm_joints_ = {0.0, 0.0, 2.0072, 0.0, 0.0};
     last_gripper_val_ = 0.0;
-    has_valid_solution_ = true;
 
     // ----- Publishers -----
     // Publishes 6-element array [J0, J1, J2, J3, J4, gripper] to /arm_cmd
@@ -236,7 +235,6 @@ private:
       double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
       current_arm_joints_[3] = std::max(-1.57, std::min(1.57, cand_q3_analytical));
       current_arm_joints_[4] = std::max(-3.14, std::min(3.14, roll));
-      has_valid_solution_ = true;
     } else {
       geometry_msgs::msg::Pose wrist_target_pose;
       wrist_target_pose.position.x = pw_in_root.x();
@@ -290,7 +288,6 @@ private:
           current_arm_joints_[2] = cand_q2;
           current_arm_joints_[3] = cand_q3;
           current_arm_joints_[4] = cand_q4;
-          has_valid_solution_ = true;
         }
       } else {
         // When TRAC-IK fails (e.g. pushed against minimum reach or elevation boundary),
@@ -308,7 +305,6 @@ private:
           double cand_q3_analytical = -world_pitch - (cand_q1 + cand_q2 - 2.00719 + 0.4363323);
           current_arm_joints_[3] = std::max(-1.57, std::min(1.57, cand_q3_analytical));
           current_arm_joints_[4] = std::max(-3.14, std::min(3.14, roll));
-          has_valid_solution_ = true;
         } else {
           RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
             "IK solver could not find a solution for wrist target (r=%.2f, th=%.2f, z=%.2f). Holding position.",
@@ -374,7 +370,6 @@ private:
   std::vector<std::string> joint_names_;
   std::vector<double> current_arm_joints_;
   double last_gripper_val_;
-  bool has_valid_solution_;
 
   std::shared_ptr<robot_model_loader::RobotModelLoader> robot_model_loader_;
   moveit::core::RobotModelPtr kinematic_model_;
