@@ -51,6 +51,8 @@ class KeyboardTeleopBridge(Node):
         "gripper_joint"
     ]
 
+    STICK_STEP = 1.0  # Full deflection for all motion axes
+
     def __init__(self):
         super().__init__('keyboard_teleop_bridge')
 
@@ -118,10 +120,9 @@ class KeyboardTeleopBridge(Node):
         # self.joy_pub.publish(joy_msg)
 
         # Clear one-shot buttons after one tick
-        if self.buttons[9] == 1:
-            self.buttons[9] = 0
-        if self.buttons[10] == 1:
-            self.buttons[10] = 0
+        for btn_idx in (9, 10):
+            if self.buttons[btn_idx]:
+                self.buttons[btn_idx] = 0
 
     def print_status(self, active_key=''):
         """Prints a single-line status bar at the bottom without scrolling the terminal."""
@@ -206,7 +207,7 @@ def main():
     spin_thread = threading.Thread(target=run_spin, daemon=True)
     spin_thread.start()
 
-    stick_step = 1.0
+    stick_step = node.STICK_STEP
     node.print_status()
 
     try:
