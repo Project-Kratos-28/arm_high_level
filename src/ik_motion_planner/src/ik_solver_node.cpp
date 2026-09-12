@@ -54,11 +54,6 @@ public:
     }
     wrist_tip_frame_ = this->get_parameter("wrist_tip_frame").as_string();
 
-    if (!this->has_parameter("cartesian_tolerance_m")) {
-      this->declare_parameter<double>("cartesian_tolerance_m", 0.010);
-    }
-    cartesian_tolerance_m_ = this->get_parameter("cartesian_tolerance_m").as_double();
-
     joint_names_ = {
       "base_yaw_joint",
       "shoulder_joint",
@@ -364,7 +359,6 @@ private:
   std::string wrist_planning_group_;
   std::string wrist_tip_frame_;
   double ik_timeout_;
-  double cartesian_tolerance_m_{0.010};
   bool use_live_joint_states_;
 
   std::vector<std::string> joint_names_;
