@@ -9,12 +9,11 @@ import time
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Joy, JointState
-from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import Joy
 
 HELP_MSG = """
 ===================================================================
-               ARM KEYBOARD TELEOP & JOINT BRIDGE
+                    ARM KEYBOARD TELEOP (/joy)
 ===================================================================
  Hold keys to move. Release to immediately stop & center axes.
 -------------------------------------------------------------------
@@ -35,38 +34,18 @@ HELP_MSG = """
 ===================================================================
 """
 
-class KeyboardTeleopBridge(Node):
+class KeyboardTeleopNode(Node):
     """
-    Dual-purpose test node:
-      1. Maps keyboard keystrokes to sensor_msgs/Joy simulating a PS5 DualSense controller.
-      2. Bridges /arm_cmd (from ps5_mapper or ik_solver_node) to /joint_states for live RViz animation.
+    Maps keyboard keystrokes to sensor_msgs/Joy simulating a PS5 DualSense controller.
     """
-
-    JOINT_NAMES = [
-        "base_yaw_joint",
-        "shoulder_joint",
-        "elbow_joint",
-        "wrist_pitch_joint",
-        "wrist_roll_joint",
-        "gripper_joint"
-    ]
 
     STICK_STEP = 1.0  # Full deflection for all motion axes
 
     def __init__(self):
-        super().__init__('keyboard_teleop_bridge')
+        super().__init__('keyboard_teleop')
 
         # ----------------- Joy Publisher -----------------
         self.joy_pub = self.create_publisher(Joy, 'joy', 10)
-
-        # ----------------- Joint State Bridge -----------------
-        self.joint_state_pub = self.create_publisher(JointState, 'joint_states', 10)
-        self.arm_cmd_sub = self.create_subscription(
-            Float64MultiArray, 'arm_cmd', self.arm_cmd_callback, 10
-        )
-
-        # Internal joint position storage [J0..J4, gripper] — initial home posture (elbow bent 115 deg)
-        self.current_joints = [0.0, 0.0, 2.0072, 0.0, 0.0, 0.0]
         self.lock = threading.Lock()
 
         # PS5 Controller State Simulation
@@ -88,36 +67,22 @@ class KeyboardTeleopBridge(Node):
         # 50 Hz Publisher Timer
         self.timer = self.create_timer(0.02, self.timer_callback)
 
-    def arm_cmd_callback(self, msg: Float64MultiArray):
-        """Receives commanded joint positions from either ps5_mapper or ik_solver_node."""
-        with self.lock:
-            for i in range(min(len(msg.data), 6)):
-                self.current_joints[i] = msg.data[i]
-
     def timer_callback(self):
-        """Publishes /joy and /joint_states at 50 Hz."""
+        """Publishes /joy at 50 Hz."""
         now = self.get_clock().now()
 
         # Auto-center motion axes when key is released (>0.2s since last keystroke)
         if self.is_moving and (time.time() - self.last_key_time > 0.2):
             self.center_motion_axes()
 
-        # 1. Publish /joint_states for RViz animation
-        js = JointState()
-        js.header.stamp = now.to_msg()
-        js.header.frame_id = 'base_link'
-        js.name = list(self.JOINT_NAMES)
-        with self.lock:
-            js.position = list(self.current_joints)
-        self.joint_state_pub.publish(js)
-
-        # 2. Publish /joy
+        # Publish /joy
         joy_msg = Joy()
         joy_msg.header.stamp = now.to_msg()
         joy_msg.header.frame_id = 'teleop_keyboard'
-        joy_msg.axes = list(self.axes)
-        joy_msg.buttons = list(self.buttons)
-        # self.joy_pub.publish(joy_msg)
+        with self.lock:
+            joy_msg.axes = list(self.axes)
+            joy_msg.buttons = list(self.buttons)
+        self.joy_pub.publish(joy_msg)
 
         # Clear one-shot buttons after one tick
         for btn_idx in (9, 10):
@@ -195,7 +160,7 @@ def main():
         settings = termios.tcgetattr(sys.stdin)
 
     rclpy.init()
-    node = KeyboardTeleopBridge()
+    node = KeyboardTeleopNode()
 
     def run_spin():
         try:

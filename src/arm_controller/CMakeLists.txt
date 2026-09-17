@@ -28,7 +28,9 @@ install(
 )
 
 install(
-  PROGRAMS src/test_with_keyboard.py
+  PROGRAMS
+    src/test_with_keyboard.py
+    src/rviz_topic_bridge.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

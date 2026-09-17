@@ -44,7 +44,7 @@ def generate_launch_description():
     declare_rviz = DeclareLaunchArgument(
         "rviz",
         default_value="false",
-        description="Launch RViz visualization",
+        description="Launch RViz visualization, robot_state_publisher, and rviz_topic_bridge",
     )
 
     # 1. Robot Description (URDF from xacro)
@@ -80,6 +80,16 @@ def generate_launch_description():
         name="robot_state_publisher",
         output="screen",
         parameters=[robot_description, {"use_sim_time": use_sim_time}],
+        condition=IfCondition(launch_rviz),
+    )
+
+    # Node: joy_node (Joystick driver)
+    joy_node = Node(
+        package="joy",
+        executable="joy_node",
+        name="joy_node",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
     )
 
     # Node: ps5_mapper (teleoperation)
@@ -132,11 +142,23 @@ def generate_launch_description():
         condition=IfCondition(launch_rviz),
     )
 
+    # Node: rviz_topic_bridge (/arm_cmd -> /joint_states for RViz)
+    bridge_node = Node(
+        package="arm_controller",
+        executable="rviz_topic_bridge.py",
+        name="rviz_topic_bridge",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
+        condition=IfCondition(launch_rviz),
+    )
+
     return LaunchDescription(
         [
             declare_use_sim_time,
             declare_rviz,
             rsp_node,
+            bridge_node,
+            joy_node,
             mapper_node,
             ik_solver_node,
             rviz_node,
