@@ -30,6 +30,7 @@ HELP_MSG = """
   [R]       : Toggle Orientation Layer (RB button)
   [SPACE]   : Immediate Stop / Center
   [X]       : Emergency Stop Lock Toggle
+  [H]       : Return to Home (SHARE button toggle)
   [Q]       : Quit Teleop
 ===================================================================
 """
@@ -84,8 +85,8 @@ class KeyboardTeleopNode(Node):
             joy_msg.buttons = list(self.buttons)
         self.joy_pub.publish(joy_msg)
 
-        # Clear one-shot buttons after one tick
-        for btn_idx in (9, 10):
+        # Clear one-shot buttons after one tick (SHARE=8, OPTIONS=9, PS=10)
+        for btn_idx in (8, 9, 10):
             if self.buttons[btn_idx]:
                 self.buttons[btn_idx] = 0
 
@@ -95,7 +96,8 @@ class KeyboardTeleopNode(Node):
         crawl_str = "ON (30%)" if self.lb_active else "OFF"
         rb_str = "ON" if self.rb_active else "OFF"
         estop_str = " | [E-STOP ACTIVE]" if self.estop_active else ""
-        sys.stdout.write(f"\r\033[K[STATUS] Mode: {self.mode_name} | Crawl: {crawl_str} | RB: {rb_str} | Motion: {motion_str}{estop_str}")
+        rth_str = " | [RTH TRIGGERED]" if self.buttons[8] else ""
+        sys.stdout.write(f"\r\033[K[STATUS] Mode: {self.mode_name} | Crawl: {crawl_str} | RB: {rb_str} | Motion: {motion_str}{estop_str}{rth_str}")
         sys.stdout.flush()
 
     def center_motion_axes(self):
@@ -123,7 +125,7 @@ class KeyboardTeleopNode(Node):
                 self.buttons[5] = 0
             self.last_key_time = time.time()
             self.is_moving = True
-        self.print_status(key_char)
+        self.print_status(active_key=key_char)
 
     def trigger_mode_toggle(self):
         """Simulates pressing the OPTIONS button (button 9)."""
@@ -138,6 +140,11 @@ class KeyboardTeleopNode(Node):
         """Simulates pressing the PS button (button 10)."""
         self.buttons[10] = 1
         self.estop_active = not self.estop_active
+        self.print_status()
+
+    def trigger_rth(self):
+        """Simulates pressing the SHARE button (button 8) for Return-to-Home toggle."""
+        self.buttons[8] = 1
         self.print_status()
 
 
@@ -241,6 +248,10 @@ def main():
             # E-Stop Toggle (X)
             elif key == 'x':
                 node.trigger_estop()
+
+            # Return-to-Home Toggle (H)
+            elif key == 'h':
+                node.trigger_rth()
 
     except Exception as e:
         print(f"Keyboard loop error: {e}")

@@ -8,6 +8,8 @@ from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy, JoyFeedback
 from std_msgs.msg import Float64MultiArray
+from rclpy.action import ActionClient
+from arm_interfaces.action import ReturnToHome
 
 
 class StickAxisLock:
@@ -176,6 +178,11 @@ class PS5Mapper(Node):
         self.prev_mode_btn_state = 0                        # IK/FK toggle button state
         self.prev_estop_btn_state = 0                       # EStop button state
         self.e_stop_active = False                          # EStop state
+        # ----- Return-to-Home (RTH) State -----
+        self.rth_active = False                             # True while RTH is executing
+        self.prev_rth_btn_state = 0                        # Rising-edge detection for SHARE
+        self.pre_rth_mode = 0                              # Mode to resume after RTH (0=FK, 1=IK)
+        self._rth_goal_handle = None                       # Active action goal handle
 
         # Axis-locking filter for Left Stick
         self.left_stick_lock = StickAxisLock()
@@ -311,6 +318,9 @@ class PS5Mapper(Node):
         # Control loop (50 Hz)
         self.control_timer = self.create_timer(self.DT, self.control_loop)
 
+        # RTH action client (connects to rth_node's /return_to_home action server)
+        self._rth_action_client = ActionClient(self, ReturnToHome, 'return_to_home')
+
         self.get_logger().info("PS5 Mapper Node started (Dual Mode: FK & IK Cartesian Control).")
 
     def apply_deadzone(self, value: float, threshold: float = None) -> float:
@@ -393,11 +403,16 @@ class PS5Mapper(Node):
         """
         Detects rising edge on the PS button to toggle the software Emergency Stop / Motion Lock.
         When active, position increments in control_loop are frozen, holding current arm and gripper position.
+        Also cancels any active RTH goal immediately.
         """
         if new_state == 1 and self.prev_estop_btn_state == 0:
             self.e_stop_active = not self.e_stop_active
             if self.e_stop_active:
                 self.get_logger().error("EMERGENCY STOP ENGAGED! Arm target position locked.")
+                # If RTH is active, cancel it immediately
+                if self.rth_active:
+                    self.get_logger().warn("E-Stop during RTH: canceling RTH goal.")
+                    self._cancel_rth_goal()
             else:
                 self.get_logger().info("EMERGENCY STOP CLEARED. Normal operation resumed.")
         self.prev_estop_btn_state = new_state
@@ -443,20 +458,137 @@ class PS5Mapper(Node):
                 )
         self.prev_mode_btn_state = new_state
 
+    def check_rth_btn(self, new_state: int):
+        """
+        Detects rising edge on SHARE (button 8) to toggle Return-to-Home mode.
+          - First press:  engages RTH, locks joystick, sends Action Goal to rth_node.
+          - Second press: cancels RTH Goal, halts arm in place, resumes prior mode bumplessly.
+        """
+        if new_state == 1 and self.prev_rth_btn_state == 0:
+            if not self.rth_active:
+                self._engage_rth()
+            else:
+                self._cancel_rth_goal()
+        self.prev_rth_btn_state = new_state
+
+    def _engage_rth(self):
+        """Locks joystick inputs and sends a ReturnToHome goal to rth_node."""
+        if not self._rth_action_client.wait_for_server(timeout_sec=1.0):
+            self.get_logger().error(
+                "[RTH] Action server '/return_to_home' not available! "
+                "Is rth_node running? RTH aborted.")
+            return
+
+        self.rth_active = True
+        self.pre_rth_mode = self.MODE
+        self.get_logger().info(
+            f"[RTH] ENGAGED. Locking joystick (pre-RTH mode: {'FK' if self.MODE == 0 else 'IK'}). "
+            "Press SHARE again to cancel.")
+
+        goal = ReturnToHome.Goal()
+        goal.speed_scaling = 1.0
+
+        send_future = self._rth_action_client.send_goal_async(
+            goal,
+            feedback_callback=self._rth_feedback_callback)
+        send_future.add_done_callback(self._rth_goal_response_callback)
+
+    def _rth_goal_response_callback(self, future):
+        """Called once the action server has accepted or rejected the goal."""
+        goal_handle = future.result()
+        if not goal_handle.accepted:
+            self.get_logger().error("[RTH] Goal rejected by rth_node. Resuming normal control.")
+            self.rth_active = False
+            return
+
+        self._rth_goal_handle = goal_handle
+        self.get_logger().info("[RTH] Goal accepted. Arm returning to home position...")
+
+        # Register result callback to handle completion or cancellation
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(self._rth_result_callback)
+
+    def _rth_result_callback(self, future):
+        """Called when the RTH action completes (succeeded, canceled, or aborted)."""
+        result_wrapper = future.result()
+        result = result_wrapper.result
+        status = result_wrapper.status
+
+        import action_msgs.msg as action_msgs_module
+        if status == action_msgs_module.GoalStatus.STATUS_SUCCEEDED:
+            self.get_logger().info(f"[RTH] Complete: {result.message}")
+        else:
+            self.get_logger().info(f"[RTH] Ended: {result.message}")
+
+        self._rth_bumpless_resume()
+
+    def _rth_feedback_callback(self, feedback_msg):
+        """
+        Receives live joint positions from rth_node and mirrors them into target_positions
+        so that bumpless resume always starts from the arm's actual stopped location.
+        """
+        joints = list(feedback_msg.feedback.current_joints)
+        for i in range(5):
+            self.target_positions[i] = joints[i]
+
+    def _cancel_rth_goal(self):
+        """Sends a cancellation request to rth_node. Result callback handles bumpless resume."""
+        self.get_logger().info("[RTH] Cancellation requested by operator.")
+        if self._rth_goal_handle is not None:
+            cancel_future = self._rth_goal_handle.cancel_goal_async()
+            cancel_future.add_done_callback(
+                lambda _: self.get_logger().info("[RTH] Cancel request sent to rth_node."))
+        else:
+            # No active goal handle — just reset state immediately
+            self._rth_bumpless_resume()
+
+    def _rth_bumpless_resume(self):
+        """
+        Restores normal teleoperation after RTH ends (success, cancel, or abort).
+        Re-seeds FK/IK state from target_positions (which was kept live via feedback callback).
+        Resumes the mode that was active before RTH.
+        """
+        # Restore pre-RTH mode
+        self.MODE = self.pre_rth_mode
+
+        if self.MODE == 1:
+            # Re-initialize IK Cartesian targets from the arm's current joint state
+            r, theta, z, world_pitch, roll = self.compute_wrist_fk(self.target_positions)
+            self.target_r = r
+            self.target_z = z
+            self._clamp_to_workspace_sphere()
+            self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], theta))
+            self.target_world_pitch = max(
+                self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], world_pitch))
+            self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], roll))
+
+        self.rth_active = False
+        self._rth_goal_handle = None
+        mode_str = 'FK' if self.MODE == 0 else 'IK'
+        self.get_logger().info(
+            f"[RTH] Normal control resumed in {mode_str} Mode. Bumpless sync complete.")
+
     def joy_callback(self, msg: Joy):
         """Records controller input state. Does NOT publish arm commands (handled by control_loop)."""
         # Validate minimum expected axes and buttons
-        if len(msg.axes) <= max(self.DPAD_X, self.DPAD_Y, self.RT, self.RJOY_Y) or len(msg.buttons) <= max(self.PS_BTN, self.OPTIONS, self.RB):
+        if len(msg.axes) <= max(self.DPAD_X, self.DPAD_Y, self.RT, self.RJOY_Y) or len(msg.buttons) <= max(self.PS_BTN, self.OPTIONS, self.RB, self.SHARE):
             return
 
         # Update watchdog heartbeat
         self.last_joy_time = self.get_clock().now()
         self.signal_lost = False
 
-        # 1. Emergency Stop / Motion Lock Latch (PS Button)
+        # 1. Emergency Stop / Motion Lock Latch (PS Button) — always active, even during RTH
         self.check_estop_btn(msg.buttons[self.PS_BTN])
 
-        # 2. Mode toggling via OPTIONS button (rising edge detection)
+        # 2. Return-to-Home Toggle (SHARE button) — always active
+        self.check_rth_btn(msg.buttons[self.SHARE])
+
+        # ── While in RTH mode, suppress ALL other joystick inputs ──
+        if self.rth_active:
+            return
+
+        # 3. Mode toggling via OPTIONS button (rising edge detection)
         self.check_mode_btn(msg.buttons[self.OPTIONS])
 
         # 3. Record D-Pad X axis for gripper open/close
@@ -665,59 +797,61 @@ class PS5Mapper(Node):
             self.target_positions[i] = max(lo, min(hi, self.target_positions[i]))
 
         # Mode-Gated Publishing:
+        # Suppressed entirely while rth_active — rth_node owns /arm_cmd during RTH.
         # FK Mode: ps5_mapper directly publishes [J0..J4, Gripper] to /arm_cmd and /arm_fk_sync
         # IK Mode: ps5_mapper publishes [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
         #          and PoseStamped to /arm_target_pose; ik_solver_node solves TRAC-IK and outputs to /arm_cmd
-        if self.MODE == 0:
-            cmd_msg = Float64MultiArray()
-            cmd_msg.data = list(self.target_positions)
-            self.publisher.publish(cmd_msg)
-            self.fk_sync_pub.publish(cmd_msg)
-        elif self.MODE == 1:
-            # Compute Cartesian Coordinates (wrist_center relative to base_link)
-            pose_msg = PoseStamped()
-            pose_msg.header.stamp = self.get_clock().now().to_msg()
-            pose_msg.header.frame_id = 'base_link'
-            pose_msg.pose.position.x = (
-                self.BASE_PIVOT_X
-                + self.target_r * math.sin(self.target_theta)
-                + self.ARM_LATERAL_OFFSET * math.cos(self.target_theta)
-            )
-            pose_msg.pose.position.y = (
-                self.BASE_PIVOT_Y
-                - self.target_r * math.cos(self.target_theta)
-                + self.ARM_LATERAL_OFFSET * math.sin(self.target_theta)
-            )
-            pose_msg.pose.position.z = self.target_z
+        if not self.rth_active:
+            if self.MODE == 0:
+                cmd_msg = Float64MultiArray()
+                cmd_msg.data = list(self.target_positions)
+                self.publisher.publish(cmd_msg)
+                self.fk_sync_pub.publish(cmd_msg)
+            elif self.MODE == 1:
+                # Compute Cartesian Coordinates (wrist_center relative to base_link)
+                pose_msg = PoseStamped()
+                pose_msg.header.stamp = self.get_clock().now().to_msg()
+                pose_msg.header.frame_id = 'base_link'
+                pose_msg.pose.position.x = (
+                    self.BASE_PIVOT_X
+                    + self.target_r * math.sin(self.target_theta)
+                    + self.ARM_LATERAL_OFFSET * math.cos(self.target_theta)
+                )
+                pose_msg.pose.position.y = (
+                    self.BASE_PIVOT_Y
+                    - self.target_r * math.cos(self.target_theta)
+                    + self.ARM_LATERAL_OFFSET * math.sin(self.target_theta)
+                )
+                pose_msg.pose.position.z = self.target_z
 
-            # Compute Auto-Leveling Orientation Quaternion matching physical tool0 frame:
-            # R_tool0 = R_z(theta) @ R_x(-world_pitch) @ R_y(roll) @ R_z(pi)
-            r_mat = (
-                R.from_euler('z', self.target_theta).as_matrix()
-                @ R.from_euler('x', -self.target_world_pitch).as_matrix()
-                @ R.from_euler('y', self.target_roll).as_matrix()
-                @ R.from_euler('z', np.pi).as_matrix()
-            )
-            qx, qy, qz, qw = R.from_matrix(r_mat).as_quat()
-            pose_msg.pose.orientation.x = float(qx)
-            pose_msg.pose.orientation.y = float(qy)
-            pose_msg.pose.orientation.z = float(qz)
-            pose_msg.pose.orientation.w = float(qw)
+                # Compute Auto-Leveling Orientation Quaternion matching physical tool0 frame:
+                # R_tool0 = R_z(theta) @ R_x(-world_pitch) @ R_y(roll) @ R_z(pi)
+                r_mat = (
+                    R.from_euler('z', self.target_theta).as_matrix()
+                    @ R.from_euler('x', -self.target_world_pitch).as_matrix()
+                    @ R.from_euler('y', self.target_roll).as_matrix()
+                    @ R.from_euler('z', np.pi).as_matrix()
+                )
+                qx, qy, qz, qw = R.from_matrix(r_mat).as_quat()
+                pose_msg.pose.orientation.x = float(qx)
+                pose_msg.pose.orientation.y = float(qy)
+                pose_msg.pose.orientation.z = float(qz)
+                pose_msg.pose.orientation.w = float(qw)
 
-            # Publish Cartesian Pose for visualization (RViz / MoveIt)
-            self.target_pose_pub.publish(pose_msg)
+                # Publish Cartesian Pose for visualization (RViz / MoveIt)
+                self.target_pose_pub.publish(pose_msg)
 
-            # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
-            ik_msg = Float64MultiArray()
-            ik_msg.data = [
-                float(self.target_r),
-                float(self.target_theta),
-                float(self.target_z),
-                float(self.target_world_pitch),
-                float(self.target_roll),
-                float(self.target_positions[5])
-            ]
-            self.ik_target_pub.publish(ik_msg)
+                # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
+                ik_msg = Float64MultiArray()
+                ik_msg.data = [
+                    float(self.target_r),
+                    float(self.target_theta),
+                    float(self.target_z),
+                    float(self.target_world_pitch),
+                    float(self.target_roll),
+                    float(self.target_positions[5])
+                ]
+                self.ik_target_pub.publish(ik_msg)
 
     def watchdog_callback(self):
         """Monitors joystick heartbeat; sets signal_lost flag if communication drops."""
@@ -734,6 +868,10 @@ class PS5Mapper(Node):
             )
 
     def grip_feedback_callback(self, msg: Float64MultiArray):
+
+        # TODO: Implement haptic feedback based on a variety of states.
+        # TODO: Possibly implement LED feedback on the controller as well.
+
         """Receives gripper feedback and publishes haptic rumble commands to DualSense."""
         if len(msg.data) < 2:
             return

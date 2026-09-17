@@ -125,6 +125,26 @@ def generate_launch_description():
         ],
     )
 
+    # Node: rth_node (Return-to-Home smooth joint interpolator with MoveIt 2 validation)
+    rth_node = Node(
+        package="ik_motion_planner",
+        executable="rth_node",
+        name="rth_node",
+        output="screen",
+        parameters=[
+            robot_description,
+            robot_description_semantic,
+            robot_description_kinematics,
+            robot_description_planning,
+            {
+                "max_joint_speed": 0.15,
+                "control_rate": 50.0,
+                "collision_check_points": 10,
+                "use_sim_time": use_sim_time,
+            },
+        ],
+    )
+
     # Node: RViz2
     rviz_config_file = os.path.join(pkg_arm_controller, "config", "moveit.rviz")
     rviz_node = Node(
@@ -161,6 +181,7 @@ def generate_launch_description():
             joy_node,
             mapper_node,
             ik_solver_node,
+            rth_node,
             rviz_node,
         ]
     )

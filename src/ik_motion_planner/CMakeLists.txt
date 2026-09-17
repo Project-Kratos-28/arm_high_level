@@ -13,6 +13,8 @@ find_package(geometry_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(moveit_core REQUIRED)
 find_package(moveit_ros_planning REQUIRED)
+find_package(rclcpp_action REQUIRED)
+find_package(arm_interfaces REQUIRED)
 
 add_executable(ik_solver_node src/ik_solver_node.cpp)
 ament_target_dependencies(ik_solver_node
@@ -24,8 +26,19 @@ ament_target_dependencies(ik_solver_node
   moveit_ros_planning
 )
 
+add_executable(rth_node src/rth_node.cpp)
+ament_target_dependencies(rth_node
+  rclcpp
+  rclcpp_action
+  std_msgs
+  moveit_core
+  moveit_ros_planning
+  arm_interfaces
+)
+
 install(TARGETS
   ik_solver_node
+  rth_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
