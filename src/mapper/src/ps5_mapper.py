@@ -487,6 +487,8 @@ class PS5Mapper(Node):
 
         goal = ReturnToHome.Goal()
         goal.speed_scaling = 1.0
+        goal.start_joints = [float(x) for x in self.target_positions[:5]]
+        goal.gripper_position = float(self.target_positions[5])
 
         send_future = self._rth_action_client.send_goal_async(
             goal,
@@ -517,6 +519,8 @@ class PS5Mapper(Node):
         import action_msgs.msg as action_msgs_module
         if status == action_msgs_module.GoalStatus.STATUS_SUCCEEDED:
             self.get_logger().info(f"[RTH] Complete: {result.message}")
+            for i in range(5):
+                self.target_positions[i] = self.HOME_POSITIONS[i]
         else:
             self.get_logger().info(f"[RTH] Ended: {result.message}")
 
@@ -550,6 +554,11 @@ class PS5Mapper(Node):
         """
         # Restore pre-RTH mode
         self.MODE = self.pre_rth_mode
+
+        # Warm-seed ik_solver_node via /arm_fk_sync with the resumed posture
+        sync_msg = Float64MultiArray()
+        sync_msg.data = list(self.target_positions)
+        self.fk_sync_pub.publish(sync_msg)
 
         if self.MODE == 1:
             # Re-initialize IK Cartesian targets from the arm's current joint state

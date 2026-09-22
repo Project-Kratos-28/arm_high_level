@@ -3,18 +3,17 @@
  *
  * Provides the /return_to_home action server (arm_interfaces/ReturnToHome).
  * On goal acceptance:
- *   1. Reads current arm joint state from /arm_joint_sync.
+ *   1. Receives current arm joint state directly from the goal payload (passed by ps5_mapper).
  *   2. Validates interpolated waypoints against URDF joint bounds AND MoveIt
  *      self-collision checking (via PlanningScene + FCL, respecting SRDF
  *      disable_collisions pairs) before any motion begins.
- *   3. Streams a synchronized smooth-step trajectory at 50 Hz to /arm_cmd
- *      and /arm_joint_sync until home is reached or the goal is cancelled.
+ *   3. Streams a synchronized smooth-step trajectory at 50 Hz directly to /arm_cmd
+ *      until home is reached or the goal is cancelled.
  * Gripper is held at its current value throughout.
  */
 
 #include <cmath>
 #include <memory>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -63,31 +62,11 @@ public:
     }
     collision_check_points_ = this->get_parameter("collision_check_points").as_int();
 
-    // ── State ────────────────────────────────────────────────────────
-    current_joints_.assign(5, 0.0);
-    current_joints_[2] = 2.0072;  // warm-seeded at home
-    last_gripper_ = 0.0;
     goal_active_ = false;
 
     // ── Publishers ───────────────────────────────────────────────────
     arm_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_cmd", 10);
-    joint_sync_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_joint_sync", 10);
-
-    // ── Subscriptions ────────────────────────────────────────────────
-    // Track current arm joint positions so trajectory starts from the real pose
-    joint_sync_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
-      "arm_joint_sync", 10,
-      [this](const std_msgs::msg::Float64MultiArray::SharedPtr msg) {
-        if (msg->data.size() >= 5) {
-          std::lock_guard<std::mutex> lock(joints_mutex_);
-          for (size_t i = 0; i < 5; ++i) {
-            current_joints_[i] = msg->data[i];
-          }
-        }
-        if (msg->data.size() >= 6) {
-          last_gripper_ = msg->data[5];
-        }
-      });
+    fk_sync_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_fk_sync", 10);
 
     // ── Action Server ────────────────────────────────────────────────
     action_server_ = rclcpp_action::create_server<RTH>(
@@ -158,18 +137,16 @@ private:
   void execute(const std::shared_ptr<GoalHandleRTH> goal_handle)
   {
     goal_active_ = true;
+    const auto goal = goal_handle->get_goal();
     const double speed_scaling = std::max(0.01, std::min(1.0,
-      goal_handle->get_goal()->speed_scaling > 0.0
-        ? goal_handle->get_goal()->speed_scaling : 1.0));
+      goal->speed_scaling > 0.0 ? goal->speed_scaling : 1.0));
 
-    // 1. Capture start state (thread-safe)
+    // 1. Read start state directly from the goal payload
     std::vector<double> start(5), delta(5);
-    double gripper_val;
-    {
-      std::lock_guard<std::mutex> lock(joints_mutex_);
-      start       = current_joints_;
-      gripper_val = last_gripper_;
+    for (size_t i = 0; i < 5; ++i) {
+      start[i] = goal->start_joints[i];
     }
+    const double gripper_val = goal->gripper_position;
 
     // 2. Compute per-joint deltas
     double max_abs_delta = 0.0;
@@ -212,7 +189,7 @@ private:
       }
     }
 
-    // 6. Stream 50 Hz trajectory
+    // 6. Stream 50 Hz trajectory directly to /arm_cmd
     rclcpp::Rate rate(control_rate_);
     const auto t_start = this->now();
     std::vector<double> cmd(5);
@@ -240,7 +217,7 @@ private:
         cmd[i] = start[i] + delta[i] * smooth_s;
       }
 
-      // ── Publish /arm_cmd and /arm_joint_sync ───────────────────
+      // ── Publish /arm_cmd ───────────────────────────────────────
       publishJoints(cmd, gripper_val);
 
       // ── Publish feedback ───────────────────────────────────────
@@ -272,7 +249,7 @@ private:
   // ── Helpers ───────────────────────────────────────────────────────
 
   /**
-   * Publish a 6-element arm command [J0..J4, gripper] to /arm_cmd and /arm_joint_sync.
+   * Publish a 6-element arm command [J0..J4, gripper] to /arm_cmd.
    */
   void publishJoints(const std::vector<double> & joints, double gripper)
   {
@@ -281,7 +258,7 @@ private:
     for (auto q : joints) msg.data.push_back(q);
     msg.data.push_back(gripper);
     arm_cmd_pub_->publish(msg);
-    joint_sync_pub_->publish(msg);
+    fk_sync_pub_->publish(msg);
   }
 
   /**
@@ -342,13 +319,8 @@ private:
   int    collision_check_points_;
   bool   goal_active_;
 
-  std::vector<double> current_joints_;
-  double last_gripper_;
-  std::mutex joints_mutex_;
-
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr arm_cmd_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr joint_sync_pub_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr joint_sync_sub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr fk_sync_pub_;
 
   rclcpp_action::Server<RTH>::SharedPtr action_server_;
 
