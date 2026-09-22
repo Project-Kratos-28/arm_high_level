@@ -1,0 +1,12 @@
+# ── Goal ──────────────────────────────────────────────────────────────
+float64 speed_scaling          # Velocity scale factor (0.0–1.0). 1.0 = full RTH speed.
+float64[5] start_joints        # Live arm joint positions at time of RTH trigger [J0..J4]
+float64 gripper_position       # Current gripper position to hold throughout motion
+---
+# ── Result ────────────────────────────────────────────────────────────
+bool   success
+string message
+---
+# ── Feedback ──────────────────────────────────────────────────────────
+float64    progress            # Normalized completion fraction [0.0, 1.0]
+float64[5] current_joints      # Live joint positions during RTH [J0..J4]

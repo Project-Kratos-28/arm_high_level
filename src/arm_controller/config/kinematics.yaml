@@ -1,0 +1,10 @@
+arm:
+  kinematics_solver: trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin
+  kinematics_solver_timeout: 0.001
+  solve_type: Distance
+  position_only_ik: true
+arm_wrist:
+  kinematics_solver: trac_ik_kinematics_plugin/TRAC_IKKinematicsPlugin
+  kinematics_solver_timeout: 0.001
+  solve_type: Distance
+  position_only_ik: true
