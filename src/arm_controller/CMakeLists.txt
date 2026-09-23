@@ -31,6 +31,7 @@ install(
   PROGRAMS
     src/test_with_keyboard.py
     src/rviz_topic_bridge.py
+    src/arm_dashboard.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

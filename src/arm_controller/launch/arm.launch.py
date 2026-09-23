@@ -1,4 +1,5 @@
 import os
+import shutil
 import yaml
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -7,6 +8,23 @@ from launch.conditions import IfCondition
 from launch.substitutions import Command, FindExecutable, LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
+
+
+def get_terminal_prefix():
+    """Detects available terminal emulator to spawn popup window without cluttering launch logs."""
+    if shutil.which("gnome-terminal"):
+        return "gnome-terminal --geometry=130x35 --title='Arm Telemetry Dashboard' --"
+    elif shutil.which("terminator"):
+        return "terminator -T 'Arm Telemetry Dashboard' --geometry=1040x600 -x"
+    elif shutil.which("xterm"):
+        return "xterm -geometry 130x35 -title 'Arm Telemetry Dashboard' -hold -e"
+    elif shutil.which("alacritty"):
+        return "alacritty --title 'Arm Telemetry Dashboard' -e"
+    elif shutil.which("konsole"):
+        return "konsole --title 'Arm Telemetry Dashboard' -e"
+    elif shutil.which("xfce4-terminal"):
+        return "xfce4-terminal --title='Arm Telemetry Dashboard' -x"
+    return ""
 
 
 def load_yaml(package_name, file_path):
@@ -35,6 +53,7 @@ def generate_launch_description():
     # Launch Arguments
     use_sim_time = LaunchConfiguration("use_sim_time")
     launch_rviz = LaunchConfiguration("rviz")
+    launch_dashboard = LaunchConfiguration("dashboard")
 
     declare_use_sim_time = DeclareLaunchArgument(
         "use_sim_time",
@@ -45,6 +64,11 @@ def generate_launch_description():
         "rviz",
         default_value="false",
         description="Launch RViz visualization, robot_state_publisher, and rviz_topic_bridge",
+    )
+    declare_dashboard = DeclareLaunchArgument(
+        "dashboard",
+        default_value="false",
+        description="Launch the live arm telemetry dashboard in a dedicated popup window",
     )
 
     # 1. Robot Description (URDF from xacro)
@@ -172,10 +196,24 @@ def generate_launch_description():
         condition=IfCondition(launch_rviz),
     )
 
+    # Node: arm_dashboard (Live telemetry dashboard spawned in dedicated popup window)
+    dashboard_prefix = get_terminal_prefix()
+    dashboard_node = Node(
+        package="arm_controller",
+        executable="arm_dashboard.py",
+        name="arm_dashboard",
+        output="screen",
+        prefix=dashboard_prefix if dashboard_prefix else None,
+        arguments=["--parent-pid", str(os.getpid())],
+        parameters=[{"use_sim_time": use_sim_time}],
+        condition=IfCondition(launch_dashboard),
+    )
+
     return LaunchDescription(
         [
             declare_use_sim_time,
             declare_rviz,
+            declare_dashboard,
             rsp_node,
             bridge_node,
             joy_node,
@@ -183,5 +221,6 @@ def generate_launch_description():
             ik_solver_node,
             rth_node,
             rviz_node,
+            dashboard_node,
         ]
     )
