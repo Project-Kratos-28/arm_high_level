@@ -136,7 +136,7 @@ class PS5Mapper(Node):
         ( 0.00,  2.50),   # 2: Elbow Pitch     (0 to +143.2°) — prevents backward elbow bending
         (-1.57,  1.57),   # 3: Wrist Pitch     (±90°)
         (-3.14,  3.14),   # 4: Wrist Roll      (±180°)
-        (-0.35,  1.57),   # 5: Gripper
+        ( 0.00,  1.57),   # 5: Gripper         (0 to +90°, matches URDF)
     ]
 
     # Kinematic mounting constants for wrist_center relative to base_link
@@ -942,7 +942,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
