@@ -132,10 +132,44 @@ flowchart TD
 
 ## 4. Quick Start
 
-### Launching the Complete System
+### 4.1. ROS 2 Workspace Setup & Build
+
+1. **Create a workspace directory**:
+   ```bash
+   mkdir -p ~/arm_ws/src
+   cd ~/arm_ws/src
+   ```
+
+2. **Clone this repository into the `src` folder**:
+   ```bash
+   git clone https://github.com/Project-Kratos-28/arm_high_level.git
+   ```
+
+3. **Install dependencies**:
+   ```bash
+   cd ~/arm_ws
+   rosdep update
+   rosdep install --from-paths src --ignore-src -r -y
+   pip install rich  # Required for the live telemetry dashboard
+   ```
+
+4. **Build the workspace with colcon**:
+   ```bash
+   colcon build --symlink-install
+   ```
+
+5. **Source the workspace overlay**:
+   ```bash
+   source install/setup.bash
+   ```
+   *(Optional: Add `source ~/arm_ws/install/setup.bash` to your `~/.bashrc` to source it automatically in new terminals).*
+
+---
+
+### 4.2. Launching the Complete System
 To launch the full teleoperation system with RViz visualization:
 ```bash
-ros2 launch arm_controller arm.launch.py rviz:=true
+ros2 launch arm_controller arm.launch.py rviz:=true #defaults to rviz:=false
 ```
 
 To launch headless on the robot hardware without visualizer overhead:
@@ -143,7 +177,23 @@ To launch headless on the robot hardware without visualizer overhead:
 ros2 launch arm_controller arm.launch.py rviz:=false
 ```
 
-### Keyboard Teleop Fallback
+### 4.3. Live Telemetry Dashboard
+To launch the complete system with the live color-coded telemetry dashboard spawned in its own dedicated window (preventing console log interference):
+```bash
+ros2 launch arm_controller arm.launch.py dashboard:=true #defaults to dashboard:=false
+```
+
+Or combine with RViz visualization:
+```bash
+ros2 launch arm_controller arm.launch.py rviz:=true dashboard:=true
+```
+
+You can also run the dashboard standalone in any open terminal window:
+```bash
+ros2 run arm_controller arm_dashboard.py
+```
+
+### 4.4. Keyboard Teleop Fallback
 If testing without a physical DualSense controller:
 ```bash
 ros2 run arm_controller test_with_keyboard.py
