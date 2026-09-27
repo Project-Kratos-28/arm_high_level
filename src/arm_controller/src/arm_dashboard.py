@@ -505,21 +505,21 @@ class ArmDashboardNode(Node):
         elif "IK" in self.control_mode:
             banner_title = "🎯  IK MODE 1 (CARTESIAN TELEOP)  │  TRAC-IK"
             banner_subtitle = "Cylindrical (r, θ, z) translation with auto-horizon leveling"
-            border_color = "bold cyan"
-            badge_style = "bold black on cyan"
+            border_color = "bold green"
+            badge_style = "bold black on green"
         else:
             banner_title = "🕹️  FK MODE 0 (DIRECT JOINT CONTROL)  │  MANUAL"
             banner_subtitle = "Direct independent joint velocity integration"
-            border_color = "bold magenta"
-            badge_style = "bold white on magenta"
+            border_color = "bold cyan"
+            badge_style = "bold black on cyan"
 
         # Precision Mode (Engaged / Disengaged)
-        prec_mode = "[bold yellow]Engaged[/bold yellow]" if self.crawl_active else "[dim]Disengaged[/dim]"
+        prec_mode = "[bold magenta]Engaged (30%)[/bold magenta]" if self.crawl_active else "[dim]Disengaged[/dim]"
         prec_badge = f"Precision Mode: {prec_mode}"
 
         # Right Stick Controls: Elbow / Wrist
-        rs_target = "[bold yellow]Wrist[/bold yellow]" if self.orientation_active else "[cyan]Elbow[/cyan]"
-        rs_badge = f"Right Stick Controls: {rs_target}"
+        rs_target = "[bold cyan]Wrist Pitch & Roll[/bold cyan]" if self.orientation_active else "[dim]Elbow Pitch[/dim]"
+        rs_badge = f"Right Stick: {rs_target}"
 
         if watchdog_ok:
             joy_badge = f"[green]JOY {rate_j:.0f}Hz[/green]"
