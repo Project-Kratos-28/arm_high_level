@@ -157,8 +157,8 @@ class ArmDashboardNode(Node):
         self.speed_gripper = 0.10
 
         # Tab Navigation State
-        # 0: Overview, 1: Joints & Limits, 2: Task-Space & RTH, 3: Speeds & Logs
-        self.active_tab = 0
+        # 1: Overview, 2: Joints & Limits, 3: Task-Space & RTH, 4: Speeds & Logs
+        self.active_tab = 1
         self.autocycle_enabled = False
         self.last_autocycle_time = time.time()
         self.autocycle_period = 2.0
@@ -370,15 +370,17 @@ class ArmDashboardNode(Node):
 
     def set_tab(self, tab_idx: int):
         with self.lock:
-            self.active_tab = max(0, min(3, tab_idx))
+            if tab_idx == 0:
+                tab_idx = 1
+            self.active_tab = max(1, min(4, tab_idx))
 
     def next_tab(self):
         with self.lock:
-            self.active_tab = (self.active_tab + 1) % 4
+            self.active_tab = (self.active_tab % 4) + 1
 
     def prev_tab(self):
         with self.lock:
-            self.active_tab = (self.active_tab - 1) % 4
+            self.active_tab = ((self.active_tab - 2) % 4) + 1
 
     def toggle_autocycle(self):
         with self.lock:
@@ -393,7 +395,7 @@ class ArmDashboardNode(Node):
             now = time.time()
             if now - self.last_autocycle_time > self.autocycle_period:
                 self.last_autocycle_time = now
-                self.active_tab = (self.active_tab + 1) % 4
+                self.active_tab = (self.active_tab % 4) + 1
 
         with self.lock:
             header_panel = self._build_header_panel()
@@ -401,8 +403,8 @@ class ArmDashboardNode(Node):
 
             layout = Layout()
 
-            if self.active_tab == 0:
-                # Overview (All-in-One View)
+            if self.active_tab == 1:
+                # Tab 1: Overview (All-in-One View)
                 joint_panel = self._build_joint_table()
                 task_panel = self._build_task_space_panel()
                 teleop_panel = self._build_teleop_panel()
@@ -424,8 +426,8 @@ class ArmDashboardNode(Node):
                 )
                 layout["footer"].update(footer_panel)
 
-            elif self.active_tab == 1:
-                # Tab 1: Joints & Limits Focus (Expands to fill terminal height)
+            elif self.active_tab == 2:
+                # Tab 2: Joints & Limits Focus (Expands to fill terminal height)
                 joint_panel = self._build_joint_table(expanded=True)
                 layout.split(
                     Layout(name="header", size=4),
@@ -436,8 +438,8 @@ class ArmDashboardNode(Node):
                 layout["tab_bar"].update(tab_bar)
                 layout["joints"].update(joint_panel)
 
-            elif self.active_tab == 2:
-                # Tab 2: Task-Space & Kinematics Focus
+            elif self.active_tab == 3:
+                # Tab 3: Task-Space & Kinematics Focus
                 task_panel = self._build_task_space_panel(expanded=True)
                 layout.split(
                     Layout(name="header", size=4),
@@ -448,8 +450,8 @@ class ArmDashboardNode(Node):
                 layout["tab_bar"].update(tab_bar)
                 layout["task_space"].update(task_panel)
 
-            elif self.active_tab == 3:
-                # Tab 3: Teleop Speeds & Event Logs Focus
+            elif self.active_tab == 4:
+                # Tab 4: Teleop Speeds & Event Logs Focus
                 teleop_panel = self._build_teleop_panel(expanded=True)
                 footer_panel = self._build_footer_panel(expanded=True)
                 layout.split(
@@ -533,10 +535,10 @@ class ArmDashboardNode(Node):
     def _build_tab_bar(self) -> Text:
         """Constructs the interactive tab selection navigation bar."""
         tabs = [
-            (0, "0: Overview"),
-            (1, "1: Joints & Limits"),
-            (2, "2: Task-Space & RTH"),
-            (3, "3: Speeds & Logs"),
+            (1, "1: Overview"),
+            (2, "2: Joints & Limits"),
+            (3, "3: Task-Space & RTH"),
+            (4, "4: Speeds & Logs"),
         ]
         parts = []
         for idx, name in tabs:
@@ -546,7 +548,7 @@ class ArmDashboardNode(Node):
                 parts.append(f"[dim]{name}[/dim]")
 
         cycle_str = "[bold green]ON (2s)[/bold green]" if self.autocycle_enabled else "[dim]OFF[/dim]"
-        nav_hint = f"[dim]│ Keys: [bold]0-3[/bold]=Tab  [bold]TAB[/bold]/[bold]Shift+TAB[/bold]=Next/Prev  [bold]A[/bold]=Auto-Cycle ({cycle_str})  [bold]Q[/bold]=Quit[/dim]"
+        nav_hint = f"[dim]│ Keys: [bold]1-4[/bold]=Tab  [bold]TAB[/bold]/[bold]Shift+TAB[/bold]=Next/Prev  [bold]A[/bold]=Auto-Cycle ({cycle_str})  [bold]Q[/bold]=Quit[/dim]"
 
         return Text.from_markup("  " + "   ".join(parts) + "   " + nav_hint)
 
@@ -825,24 +827,33 @@ def _start_keyboard_listener(node: ArmDashboardNode):
         try:
             tty.setcbreak(fd)
             while rclpy.ok():
-                r, _, _ = select.select([sys.stdin], [], [], 0.2)
+                r, _, _ = select.select([fd], [], [], 0.2)
                 if r:
-                    ch = sys.stdin.read(1)
-                    if ch in ('0', '1', '2', '3'):
-                        node.set_tab(int(ch))
-                    elif ch == '\t':  # Tab -> forward
-                        node.next_tab()
-                    elif ch == '\x1b':  # Escape sequence, e.g. Shift-Tab (\x1b[Z)
-                        r_seq, _, _ = select.select([sys.stdin], [], [], 0.05)
+                    data = os.read(fd, 32).decode('utf-8', errors='ignore')
+                    if not data:
+                        continue
+
+                    # If an isolated escape arrived, give a short window to capture rest of escape sequence
+                    if data == '\x1b':
+                        r_seq, _, _ = select.select([fd], [], [], 0.05)
                         if r_seq:
-                            seq = sys.stdin.read(2)
-                            if seq == '[Z':  # Shift-Tab (Back-Tab)
-                                node.prev_tab()
-                    elif ch == ' ':
+                            data += os.read(fd, 31).decode('utf-8', errors='ignore')
+
+                    if data in ('1', '2', '3', '4'):
+                        node.set_tab(int(data))
+                    elif data == '0':
+                        node.set_tab(1)
+                    elif data in ('\t', ' ', '\x1b[C', 'n', 'N'):  # Tab, Space, Right Arrow, 'n' -> Next Tab
                         node.next_tab()
-                    elif ch in ('a', 'A'):
+                    elif (
+                        data in ('\x1b[Z', '\x1b[27;2;9~', '\x1b[9;2u', '\x1b\t', '\x1b[D')
+                        or data in ('p', 'P', 'b', 'B')
+                        or '\x1b[Z' in data
+                    ):  # Shift-Tab (VT100 Back-Tab, xterm, CSI-u), Left Arrow, Prev/Back
+                        node.prev_tab()
+                    elif data in ('a', 'A'):
                         node.toggle_autocycle()
-                    elif ch in ('q', 'Q'):
+                    elif data in ('q', 'Q'):
                         os._exit(0)
         except Exception:
             pass
