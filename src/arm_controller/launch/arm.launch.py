@@ -54,6 +54,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration("use_sim_time")
     launch_rviz = LaunchConfiguration("rviz")
     launch_dashboard = LaunchConfiguration("dashboard")
+    launch_lights = LaunchConfiguration("lights")
 
     declare_use_sim_time = DeclareLaunchArgument(
         "use_sim_time",
@@ -69,6 +70,11 @@ def generate_launch_description():
         "dashboard",
         default_value="false",
         description="Launch the live arm telemetry dashboard in a dedicated popup window",
+    )
+    declare_lights = DeclareLaunchArgument(
+        "lights",
+        default_value="true",
+        description="Launch PS5 controller lights manipulation and mode telemetry node",
     )
 
     # 1. Robot Description (URDF from xacro)
@@ -123,6 +129,16 @@ def generate_launch_description():
         name="ps5_mapper",
         output="screen",
         parameters=[{"use_sim_time": use_sim_time}],
+    )
+
+    # Node: ps5_lights_node (PS5 controller lights manipulation & mode telemetry)
+    lights_node = Node(
+        package="mapper",
+        executable="ps5_lights_node",
+        name="ps5_lights_node",
+        output="screen",
+        parameters=[{"use_sim_time": use_sim_time}],
+        condition=IfCondition(launch_lights),
     )
 
     # Node: ik_solver_node (TRAC-IK MoveIt 2 Solver)
@@ -214,10 +230,12 @@ def generate_launch_description():
             declare_use_sim_time,
             declare_rviz,
             declare_dashboard,
+            declare_lights,
             rsp_node,
             bridge_node,
             joy_node,
             mapper_node,
+            lights_node,
             ik_solver_node,
             rth_node,
             rviz_node,
