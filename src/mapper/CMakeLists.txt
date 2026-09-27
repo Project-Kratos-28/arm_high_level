@@ -19,6 +19,12 @@ install(PROGRAMS
   RENAME ps5_mapper
 )
 
+install(PROGRAMS
+  src/ps5_lights_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME ps5_lights_node
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
