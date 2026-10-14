@@ -84,8 +84,8 @@ class PS5Mapper(Node):
           * Right Bumper (RB) toggles the Right Stick to control World Pitch and Axial Wrist Roll.
       - Deterministic 50 Hz Position Integration Loop.
       - Dominant-Axis Locking (eliminates accidental diagonal stick cross-talk).
-      - Gripper Position Integration on D-Pad Left/Right (Left = Open, Right = Close).
-      - Gripper Max Speed Trimming on D-Pad Up/Down (+/-).
+      - Momentary Gripper Control on D-Pad Left/Right (Left = Open [+1.0], Right = Close [-1.0], Neutral = [0.0]).
+      - Gripper Feedback on /gripper_feedback (Float64MultiArray: [angle, load, gripping]).
       - Live Joint & Cartesian Speed Trimming via Shape Buttons + Triggers (LT/RT):
           * CROSS (Hold)    + RT/LT -> Base Yaw (FK) / Azimuth (IK) Max Speed (+/-)
           * SQUARE (Hold)   + RT/LT -> Shoulder Pitch (FK) / Reach (IK) Max Speed (+/-)
@@ -265,11 +265,14 @@ class PS5Mapper(Node):
         self.prev_lt_active = False
         self.prev_rt_active = False
 
-        # ----- Gripper Speed Trimming Timing State (D-Pad Up/Down) -----
-        self.gripper_trim_last_time = 0.0
-        self.gripper_trim_held_start_time = 0.0
-        self.prev_dpad_up = False
-        self.prev_dpad_down = False
+        # ----- Gripper Feedback & Limit Rumble State -----
+        self.gripper_feedback_angle = 0.0
+        self.gripper_feedback_load = 0.0
+        self.gripper_is_gripping = False
+        self.limit_rumble_until = 0.0
+        self.was_at_min_limit = False
+        self.was_at_max_limit = False
+        self.prev_dpad_x = 0.0
 
         # ----- Subscriptions -----
         self.subscription = self.create_subscription(
@@ -277,7 +280,7 @@ class PS5Mapper(Node):
         )
 
         self.grip_feedback_subscription = self.create_subscription(
-            Float64MultiArray, 'gripper_state', self.grip_feedback_callback, 10
+            Float64MultiArray, 'gripper_feedback', self.grip_feedback_callback, 10
         )
 
         # Subscriber for bumpless IK -> FK joint mirroring from ik_solver_node
@@ -600,40 +603,21 @@ class PS5Mapper(Node):
         # 3. Mode toggling via OPTIONS button (rising edge detection)
         self.check_mode_btn(msg.buttons[self.OPTIONS])
 
-        # 3. Record D-Pad X axis for gripper open/close
-        self.dpad_x = msg.axes[self.DPAD_X]
+        # 3. Record D-Pad X axis for gripper open/close and detect pushes into limits
+        dpad_x = msg.axes[self.DPAD_X]
+        min_lim, max_lim = self.JOINT_LIMITS[5]
+        if dpad_x > 0.5 and self.prev_dpad_x <= 0.5:
+            # Operator commanded Open, but already at or above max limit
+            if self.gripper_feedback_angle >= max_lim - 0.01:
+                self.trigger_limit_rumble()
+        elif dpad_x < -0.5 and self.prev_dpad_x >= -0.5:
+            # Operator commanded Close, but already at or below min limit
+            if self.gripper_feedback_angle <= min_lim + 0.01:
+                self.trigger_limit_rumble()
+        self.prev_dpad_x = dpad_x
+        self.dpad_x = dpad_x
 
-        # 4. D-Pad Y axis: Gripper Speed Trimming (Up = increase, Down = decrease)
-        dpad_y = msg.axes[self.DPAD_Y]
-        dpad_up = (dpad_y > 0.5)
-        dpad_down = (dpad_y < -0.5)
-
-        step = self.speed_step
-        min_s = self.trim_min_bound
-        max_s = self.trim_max_bound
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-
-        grip_delta = 0.0
-        if dpad_up and not dpad_down:
-            grip_delta = step
-        elif dpad_down and not dpad_up:
-            grip_delta = -step
-
-        if grip_delta != 0.0:
-            is_new_press = (dpad_up and not self.prev_dpad_up) or (dpad_down and not self.prev_dpad_down)
-            if is_new_press:
-                self.gripper_trim_held_start_time = now_sec
-                self.gripper_trim_last_time = now_sec
-                self._apply_speed_delta("Gripper", grip_delta, min_s, max_s)
-            else:
-                if (now_sec - self.gripper_trim_held_start_time) > 0.4 and (now_sec - self.gripper_trim_last_time) > 0.15:
-                    self.gripper_trim_last_time = now_sec
-                    self._apply_speed_delta("Gripper", grip_delta, min_s, max_s)
-
-        self.prev_dpad_up = dpad_up
-        self.prev_dpad_down = dpad_down
-
-        # 5. Speed Trimming (Shape Buttons + Triggers)
+        # 4. Speed Trimming (Shape Buttons + Triggers)
         cross_held = bool(msg.buttons[self.CROSS])
         square_held = bool(msg.buttons[self.SQUARE])
         circle_held = bool(msg.buttons[self.CIRCLE])
@@ -642,6 +626,11 @@ class PS5Mapper(Node):
         self.is_tuning_speed = cross_held or square_held or circle_held or triangle_held
 
         if self.is_tuning_speed:
+            step = self.speed_step
+            min_s = self.trim_min_bound
+            max_s = self.trim_max_bound
+            now_sec = self.get_clock().now().nanoseconds / 1e9
+
             if self.MODE == 0:
                 if cross_held:
                     selected_axis = "Base Yaw"
@@ -795,14 +784,21 @@ class PS5Mapper(Node):
                     )
                     self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], self.target_roll))
 
-            # Gripper integration (always active, even during arm speed tuning)
-            if self.dpad_x > 0.5:
-                self.target_positions[5] += self.max_gripper_speed * speed_mult * dt    # Open
-            elif self.dpad_x < -0.5:
-                self.target_positions[5] -= self.max_gripper_speed * speed_mult * dt    # Close
+            # Gated momentary gripper control:
+            # D-Pad Left = +1.0 (Open) only if physical angle < max_limit
+            # D-Pad Right = -1.0 (Close) only if physical angle > min_limit
+            # Neutral = 0.0
+            min_angle, max_angle = self.JOINT_LIMITS[5]
+            if self.dpad_x > 0.5 and self.gripper_feedback_angle < max_angle:
+                self.target_positions[5] = 1.0     # Open
+            elif self.dpad_x < -0.5 and self.gripper_feedback_angle > min_angle:
+                self.target_positions[5] = -1.0    # Close
+            else:
+                self.target_positions[5] = 0.0     # Revert to neutral
 
-        # Clamp all joints to limits to prevent command windup
-        for i, (lo, hi) in enumerate(self.JOINT_LIMITS):
+        # Clamp arm joints (0..4) to limits to prevent command windup
+        for i in range(5):
+            lo, hi = self.JOINT_LIMITS[i]
             self.target_positions[i] = max(lo, min(hi, self.target_positions[i]))
 
         # Mode-Gated Publishing:
@@ -862,6 +858,9 @@ class PS5Mapper(Node):
                 ]
                 self.ik_target_pub.publish(ik_msg)
 
+        # Update and publish blended haptic feedback (limit rumble pulse & grip load)
+        self._publish_rumble_feedback()
+
     def watchdog_callback(self):
         """Monitors joystick heartbeat; sets signal_lost flag if communication drops."""
         if self.last_joy_time is None:
@@ -876,25 +875,71 @@ class PS5Mapper(Node):
                 f"Joy input timed out ({elapsed_sec:.2f}s > {timeout}s). Position held."
             )
 
-    def grip_feedback_callback(self, msg: Float64MultiArray):
+    def trigger_limit_rumble(self):
+        """Triggers a 200 ms momentary tactile rumble at 80% intensity for limit contact."""
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        self.limit_rumble_until = now_sec + 0.20
+        self._publish_rumble_feedback()
 
-        # TODO: Implement haptic feedback based on a variety of states.
-        # TODO: Possibly implement LED feedback on the controller as well.
+    def _publish_rumble_feedback(self):
+        """Calculates blended rumble intensity and publishes to /joy/set_feedback."""
+        now_sec = self.get_clock().now().nanoseconds / 1e9
+        limit_intensity = 0.80 if now_sec < self.limit_rumble_until else 0.0
 
-        """Receives gripper feedback and publishes haptic rumble commands to DualSense."""
-        if len(msg.data) < 2:
-            return
+        if self.gripper_is_gripping:
+            load_intensity = max(0.0, min(1.0, self.gripper_feedback_load / 500.0))
+        else:
+            load_intensity = 0.0
 
-        is_gripping = bool(msg.data[1])
-        self.get_logger().info(f"Gripper Feedback: {'Gripping' if is_gripping else 'Not Gripping'}")
+        total_intensity = max(limit_intensity, load_intensity)
 
-        intensity = float(msg.data[1])
         for rumble_id in (0, 1):
             fb = JoyFeedback()
             fb.type = JoyFeedback.TYPE_RUMBLE
             fb.id = rumble_id
-            fb.intensity = intensity
+            fb.intensity = total_intensity
             self.feedback_publisher.publish(fb)
+
+    def grip_feedback_callback(self, msg: Float64MultiArray):
+        # 787 = 90, 1817 = 0 angle mapping.
+        # load exceed 50 then freeze internal angle and move into gripping object state.
+        # when gripping, if close is commanded nothing happens. load values from servo just update.
+        # when gripping and open is commanded, the gripper will open and exit gripping state, and read the new angle comign in.
+        """Receives gripper feedback and publishes haptic rumble commands to DualSense.
+
+        Payload:
+          msg.data[0]: angle of the gripper (float, radians)
+          msg.data[1]: load the gripper is experiencing (float, 0 to 1000)
+          msg.data[2]: 1.0 or 0.0 based on whether the gripper is "gripping" or "not gripping"
+        """
+        if len(msg.data) < 3:
+            return
+
+        self.gripper_feedback_angle = float(msg.data[0])
+        self.gripper_feedback_load = float(msg.data[1])
+        self.gripper_is_gripping = bool(msg.data[1] > 50)
+
+        # Detect edge arrival at physical limits (0.00 rad closed, 1.57 rad open)
+        min_lim, max_lim = self.JOINT_LIMITS[5]
+        limit_triggered = False
+        if self.gripper_feedback_angle <= min_lim + 0.01:
+            if not self.was_at_min_limit:
+                self.trigger_limit_rumble()
+                self.was_at_min_limit = True
+                limit_triggered = True
+        elif self.gripper_feedback_angle > min_lim + 0.03:
+            self.was_at_min_limit = False
+
+        if self.gripper_feedback_angle >= max_lim - 0.01:
+            if not self.was_at_max_limit:
+                self.trigger_limit_rumble()
+                self.was_at_max_limit = True
+                limit_triggered = True
+        elif self.gripper_feedback_angle < max_lim - 0.03:
+            self.was_at_max_limit = False
+
+        if not limit_triggered:
+            self._publish_rumble_feedback()
 
     def compute_wrist_fk(self, joints: list[float]) -> tuple[float, float, float, float, float]:
         """
