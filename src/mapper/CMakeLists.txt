@@ -25,6 +25,12 @@ install(PROGRAMS
   RENAME ps5_lights_node
 )
 
+install(PROGRAMS
+  src/virtual_gripper.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME virtual_gripper
+)
+
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
   ament_lint_auto_find_test_dependencies()
