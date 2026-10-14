@@ -136,6 +136,7 @@ class ArmDashboardNode(Node):
         self.rth_status = "IDLE"
         self.rth_progress = 0.0
         self.rth_initial_dist = 1.0
+        self.gripper_angle = 0.0
         self.gripper_load = 0.0
         self.is_gripping = False
 
@@ -180,7 +181,7 @@ class ArmDashboardNode(Node):
         self.create_subscription(Float64MultiArray, 'arm_ik_cmd', self._arm_ik_cmd_cb, 10)
         self.create_subscription(PoseStamped, 'arm_target_pose', self._target_pose_cb, 10)
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
-        self.create_subscription(Float64MultiArray, 'gripper_state', self._gripper_cb, 10)
+        self.create_subscription(Float64MultiArray, 'gripper_feedback', self._gripper_cb, 10)
         self.create_subscription(Log, '/rosout', self._rosout_cb, 20)
 
         # Initial forward kinematics computation
@@ -238,9 +239,10 @@ class ArmDashboardNode(Node):
 
     def _gripper_cb(self, msg: Float64MultiArray):
         with self.lock:
-            if len(msg.data) >= 2:
-                self.is_gripping = bool(msg.data[1] > 0.5)
+            if len(msg.data) >= 3:
+                self.gripper_angle = float(msg.data[0])
                 self.gripper_load = float(msg.data[1])
+                self.is_gripping = bool(msg.data[2] > 0.5)
 
     def _rosout_cb(self, msg: Log):
         relevant_nodes = ("ps5_mapper", "ik_solver_node", "rth_node", "rviz_topic_bridge")
@@ -565,7 +567,7 @@ class ArmDashboardNode(Node):
         q = self.joint_positions
         vels = self.joint_velocities
 
-        gripper_pct = int(round(max(0.0, min(1.0, (q[5] - self.JOINT_LIMITS[5][0]) / (self.JOINT_LIMITS[5][1] - self.JOINT_LIMITS[5][0]))) * 100))
+        gripper_pct = int(round(max(0.0, min(1.0, (self.gripper_angle - self.JOINT_LIMITS[5][0]) / (self.JOINT_LIMITS[5][1] - self.JOINT_LIMITS[5][0]))) * 100))
 
         ground_angles = [
             math.degrees(q[0]),                                             # J0: Base Yaw (Azimuth)
@@ -573,7 +575,7 @@ class ArmDashboardNode(Node):
             -math.degrees(q[1] + q[2] - 2.00719),                           # J2: Elbow (Forearm)
             -math.degrees(q[1] + q[2] - 2.00719 + q[3] + 0.4363323),        # J3: Wrist (Horizon)
             math.degrees(q[4]),                                             # J4: Wrist Roll
-            math.degrees(q[5]),                                             # J5: Gripper
+            math.degrees(self.gripper_angle),                               # J5: Gripper
         ]
 
         ground_labels = [
@@ -582,38 +584,49 @@ class ArmDashboardNode(Node):
             f"{ground_angles[2]:+6.1f}° (Forearm)",
             f"{ground_angles[3]:+6.1f}° (Horizon)",
             f"{ground_angles[4]:+6.1f}° (Roll)",
-            f"{gripper_pct:3d}% Open",
+            f"{gripper_pct:3d}% Open ({ground_angles[5]:.1f}°)",
         ]
 
         bar_width = 13 if not expanded else 21
 
         for i in range(6):
             name = self.JOINT_NAMES[i]
-            q_rad = q[i]
-            v_degs = math.degrees(vels[i])
             min_lim, max_lim = self.JOINT_LIMITS[i]
 
             min_deg = math.degrees(min_lim)
             max_deg = math.degrees(max_lim)
 
             if i == 5:
+                q_rad_str = f"{self.gripper_angle:7.3f} rad"
+                cmd_val = q[5]
+                if cmd_val > 0.5:
+                    vel_str = "[bold cyan]+1 (OPEN)[/bold cyan]"
+                elif cmd_val < -0.5:
+                    vel_str = "[bold yellow]-1 (CLSD)[/bold yellow]"
+                else:
+                    vel_str = "[dim] 0 (HOLD)[/dim]"
+
                 range_str = "[   0%,   100%]"
-                bar_markup = self._format_gripper_bar(q_rad, min_lim, max_lim, width=bar_width)
+                bar_markup = self._format_gripper_bar(self.gripper_angle, min_lim, max_lim, width=bar_width)
             else:
+                q_rad = q[i]
+                q_rad_str = f"{q_rad:+7.3f} rad"
+                v_degs = math.degrees(vels[i])
+                vel_style = "dim"
+                if abs(v_degs) > 15.0:
+                    vel_style = "bold yellow"
+                elif abs(v_degs) > 2.0:
+                    vel_style = "green"
+                vel_str = f"[{vel_style}]{v_degs:+6.1f}°/s[/{vel_style}]"
+
                 range_str = f"[{min_deg:+5.0f}°, {max_deg:+5.0f}°]"
                 bar_markup = self._format_limit_bar(q_rad, min_lim, max_lim, width=bar_width)
-
-            vel_style = "dim"
-            if abs(v_degs) > 15.0:
-                vel_style = "bold yellow"
-            elif abs(v_degs) > 2.0:
-                vel_style = "green"
 
             table.add_row(
                 name,
                 ground_labels[i],
-                f"{q_rad:+7.3f} rad",
-                f"[{vel_style}]{v_degs:+6.1f}°/s[/{vel_style}]",
+                q_rad_str,
+                vel_str,
                 range_str,
                 bar_markup,
             )
@@ -741,15 +754,24 @@ class ArmDashboardNode(Node):
         table.add_column("Parameter", style="bold white", width=22)
         table.add_column("Status / Speed", style="bold white", width=26)
 
-        # Gripper row
-        grip_pct = int(round(max(0.0, min(1.0, (self.joint_positions[5] - self.JOINT_LIMITS[5][0]) / (self.JOINT_LIMITS[5][1] - self.JOINT_LIMITS[5][0]))) * 100))
+        # Combined Gripper row (Command, Opening %, Load, Grip state)
+        cmd_val = self.joint_positions[5]
+        if cmd_val > 0.5:
+            cmd_desc = "[bold cyan]OPEN (+1)[/bold cyan]"
+        elif cmd_val < -0.5:
+            cmd_desc = "[bold yellow]CLOSE (-1)[/bold yellow]"
+        else:
+            cmd_desc = "[dim]HOLD (0)[/dim]"
+
+        min_g, max_g = self.JOINT_LIMITS[5]
+        grip_pct = int(round(max(0.0, min(1.0, (self.gripper_angle - min_g) / (max_g - min_g))) * 100))
         if self.is_gripping:
-            grip_str = f"[bold green]GRIPPING[/bold green] ({grip_pct}% | Load: {self.gripper_load:.1f})"
+            status_desc = f"[bold green]GRIPPING[/bold green] ({grip_pct}% | Load: {self.gripper_load:.1f})"
         else:
             state_desc = "CLOSED" if grip_pct <= 2 else ("OPEN" if grip_pct >= 98 else f"{grip_pct}% OPEN")
-            grip_str = f"[cyan]{state_desc}[/cyan]"
-        table.add_row("Gripper State:", grip_str)
-        table.add_row("Gripper Max Speed:", f"{self.speed_gripper:.2f} rad/s")
+            status_desc = f"[cyan]{state_desc}[/cyan] (Load: {self.gripper_load:.1f})"
+
+        table.add_row("Gripper:", f"{cmd_desc} | {status_desc}")
 
         # Context-Switching Speed Trims (FK vs IK)
         if "FK" in self.control_mode:
