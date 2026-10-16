@@ -25,7 +25,7 @@ import select
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Float32MultiArray
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import Log
@@ -181,7 +181,7 @@ class ArmDashboardNode(Node):
         self.create_subscription(Float64MultiArray, 'arm_ik_cmd', self._arm_ik_cmd_cb, 10)
         self.create_subscription(PoseStamped, 'arm_target_pose', self._target_pose_cb, 10)
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
-        self.create_subscription(Float64MultiArray, 'gripper_feedback', self._gripper_cb, 10)
+        self.create_subscription(Float32MultiArray, 'gripper_feedback', self._gripper_cb, 10)
         self.create_subscription(Log, '/rosout', self._rosout_cb, 20)
 
         # Initial forward kinematics computation
@@ -237,12 +237,12 @@ class ArmDashboardNode(Node):
                 self.crawl_active = bool(msg.buttons[4])
                 self.orientation_active = bool(msg.buttons[5])
 
-    def _gripper_cb(self, msg: Float64MultiArray):
+    def _gripper_cb(self, msg: Float32MultiArray):
         with self.lock:
-            if len(msg.data) >= 3:
+            if len(msg.data) >= 2:
                 self.gripper_angle = float(msg.data[0])
                 self.gripper_load = float(msg.data[1])
-                self.is_gripping = bool(msg.data[2] > 0.5)
+                self.is_gripping = bool(self.gripper_load > 400.0)
 
     def _rosout_cb(self, msg: Log):
         relevant_nodes = ("ps5_mapper", "ik_solver_node", "rth_node", "rviz_topic_bridge")
