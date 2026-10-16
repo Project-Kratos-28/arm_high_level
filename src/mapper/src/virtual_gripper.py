@@ -6,14 +6,14 @@ Autonomous virtual gripper simulation node:
 - Subscribes to /arm_cmd to read momentary gripper commands (-1.0 Close, +1.0 Open, 0.0 Stop).
 - Simulates physical gripper motion at a constant speed of 0.2 rad/s.
 - Simulates grasp contact, load buildup, and grip status.
-- Publishes /gripper_feedback [angle, load, gripping] continuously at 50 Hz.
+- Publishes /gripper_feedback [angle, load] continuously at 50 Hz.
 - Runs indefinitely until interrupted (Ctrl+C).
 """
 
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Float32MultiArray
 from sensor_msgs.msg import JoyFeedback
 
 
@@ -44,7 +44,7 @@ class VirtualGripperNode(Node):
         self.rumble_intensity = 0.0
 
         # ROS 2 Interfaces
-        self.feedback_pub = self.create_publisher(Float64MultiArray, '/gripper_feedback', 10)
+        self.feedback_pub = self.create_publisher(Float32MultiArray, '/gripper_feedback', 10)
         self.cmd_sub = self.create_subscription(Float64MultiArray, '/arm_cmd', self.cmd_callback, 10)
         self.rumble_sub = self.create_subscription(JoyFeedback, '/joy/set_feedback', self.rumble_callback, 10)
 
@@ -92,21 +92,20 @@ class VirtualGripperNode(Node):
                 # Contact with object: position holds, load builds up
                 self.virtual_angle = self.contact_angle
                 self.virtual_load = min(1000.0, self.virtual_load + 250.0 * dt)
-                self.virtual_gripping = 1.0 if self.virtual_load > 40.0 else 0.0
+                self.virtual_gripping = 1.0 if self.virtual_load > 400.0 else 0.0
 
         # 3. Neutral / Hold Command (0.0)
         else:
             # Load decays slowly when held
             self.virtual_load = max(10.0, self.virtual_load - 50.0 * dt)
-            if self.virtual_load <= 40.0:
+            if self.virtual_load <= 400.0:
                 self.virtual_gripping = 0.0
 
-        # Publish /gripper_feedback [angle, load, gripping]
-        feedback_msg = Float64MultiArray()
+        # Publish /gripper_feedback [angle, load]
+        feedback_msg = Float32MultiArray()
         feedback_msg.data = [
             float(self.virtual_angle),
             float(self.virtual_load),
-            float(self.virtual_gripping),
         ]
         self.feedback_pub.publish(feedback_msg)
 
