@@ -7,7 +7,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy, JoyFeedback
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float64MultiArray, Float32MultiArray
 from rclpy.action import ActionClient
 from arm_interfaces.action import ReturnToHome
 
@@ -85,7 +85,7 @@ class PS5Mapper(Node):
       - Deterministic 50 Hz Position Integration Loop.
       - Dominant-Axis Locking (eliminates accidental diagonal stick cross-talk).
       - Momentary Gripper Control on D-Pad Left/Right (Left = Open [+1.0], Right = Close [-1.0], Neutral = [0.0]).
-      - Gripper Feedback on /gripper_feedback (Float64MultiArray: [angle, load, gripping]).
+      - Gripper Feedback on /gripper_feedback (Float32MultiArray: [angle, load]).
       - Live Joint & Cartesian Speed Trimming via Shape Buttons + Triggers (LT/RT):
           * CROSS (Hold)    + RT/LT -> Base Yaw (FK) / Azimuth (IK) Max Speed (+/-)
           * SQUARE (Hold)   + RT/LT -> Shoulder Pitch (FK) / Reach (IK) Max Speed (+/-)
@@ -268,7 +268,6 @@ class PS5Mapper(Node):
         # ----- Gripper Feedback & Limit Rumble State -----
         self.gripper_feedback_angle = 0.0
         self.gripper_feedback_load = 0.0
-        self.gripper_is_gripping = False
         self.limit_rumble_until = 0.0
         self.was_at_min_limit = False
         self.was_at_max_limit = False
@@ -280,7 +279,7 @@ class PS5Mapper(Node):
         )
 
         self.grip_feedback_subscription = self.create_subscription(
-            Float64MultiArray, 'gripper_feedback', self.grip_feedback_callback, 10
+            Float32MultiArray, 'gripper_feedback', self.grip_feedback_callback, 10
         )
 
         # Subscriber for bumpless IK -> FK joint mirroring from ik_solver_node
@@ -886,8 +885,8 @@ class PS5Mapper(Node):
         now_sec = self.get_clock().now().nanoseconds / 1e9
         limit_intensity = 0.80 if now_sec < self.limit_rumble_until else 0.0
 
-        if self.gripper_is_gripping:
-            load_intensity = max(0.0, min(1.0, self.gripper_feedback_load / 500.0))
+        if self.gripper_feedback_load > 150.0:
+            load_intensity = min(1.0, (self.gripper_feedback_load - 150.0) / 850.0)
         else:
             load_intensity = 0.0
 
@@ -900,7 +899,7 @@ class PS5Mapper(Node):
             fb.intensity = total_intensity
             self.feedback_publisher.publish(fb)
 
-    def grip_feedback_callback(self, msg: Float64MultiArray):
+    def grip_feedback_callback(self, msg: Float32MultiArray):
         # 787 = 90, 1817 = 0 angle mapping.
         # load exceed 50 then freeze internal angle and move into gripping object state.
         # when gripping, if close is commanded nothing happens. load values from servo just update.
@@ -910,14 +909,12 @@ class PS5Mapper(Node):
         Payload:
           msg.data[0]: angle of the gripper (float, radians)
           msg.data[1]: load the gripper is experiencing (float, 0 to 1000)
-          msg.data[2]: 1.0 or 0.0 based on whether the gripper is "gripping" or "not gripping"
         """
-        if len(msg.data) < 3:
+        if len(msg.data) < 2:
             return
 
         self.gripper_feedback_angle = float(msg.data[0])
         self.gripper_feedback_load = float(msg.data[1])
-        self.gripper_is_gripping = bool(msg.data[1] > 50)
 
         # Detect edge arrival at physical limits (0.00 rad closed, 1.57 rad open)
         min_lim, max_lim = self.JOINT_LIMITS[5]
