@@ -20,7 +20,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 
 #include <moveit/robot_model_loader/robot_model_loader.hpp>
 #include <moveit/robot_model/robot_model.hpp>
@@ -65,8 +65,8 @@ public:
     goal_active_ = false;
 
     // ── Publishers ───────────────────────────────────────────────────
-    arm_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_cmd", 10);
-    fk_sync_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_fk_sync", 10);
+    arm_cmd_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("arm_cmd", 10);
+    fk_sync_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("arm_fk_sync", 10);
 
     // ── Action Server ────────────────────────────────────────────────
     action_server_ = rclcpp_action::create_server<RTH>(
@@ -253,7 +253,7 @@ private:
    */
   void publishJoints(const std::vector<double> & joints, double gripper)
   {
-    std_msgs::msg::Float64MultiArray msg;
+    std_msgs::msg::Float32MultiArray msg;
     msg.data.reserve(6);
     for (auto q : joints) msg.data.push_back(q);
     msg.data.push_back(gripper);
@@ -319,8 +319,8 @@ private:
   int    collision_check_points_;
   bool   goal_active_;
 
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr arm_cmd_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr fk_sync_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr arm_cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr fk_sync_pub_;
 
   rclcpp_action::Server<RTH>::SharedPtr action_server_;
 

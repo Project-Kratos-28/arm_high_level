@@ -4,7 +4,7 @@
 #include <cmath>
 
 #include <rclcpp/rclcpp.hpp>
-#include <std_msgs/msg/float64_multi_array.hpp>
+#include <std_msgs/msg/float32_multi_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
@@ -80,19 +80,19 @@ public:
 
     // ----- Publishers -----
     // Publishes 6-element array [J0, J1, J2, J3, J4, gripper] to /arm_cmd
-    arm_cmd_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_cmd", 10);
+    arm_cmd_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("arm_cmd", 10);
 
     // Publishes solved joint angles to /arm_joint_sync for bumpless IK -> FK state mirroring in ps5_mapper
-    joint_sync_pub_ = this->create_publisher<std_msgs::msg::Float64MultiArray>("arm_joint_sync", 10);
+    joint_sync_pub_ = this->create_publisher<std_msgs::msg::Float32MultiArray>("arm_joint_sync", 10);
 
     // ----- Subscriptions -----
     // Subscribes to PS5 Mapper IK commands [r, theta, z, world_pitch, roll, gripper]
-    ik_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+    ik_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
       "arm_ik_cmd", 10,
       std::bind(&IKSolverNode::ikCmdCallback, this, std::placeholders::_1));
 
     // Continuous FK state synchronization from ps5_mapper (for bumpless FK -> IK warm seeding)
-    fk_sync_sub_ = this->create_subscription<std_msgs::msg::Float64MultiArray>(
+    fk_sync_sub_ = this->create_subscription<std_msgs::msg::Float32MultiArray>(
       "arm_fk_sync", 10,
       std::bind(&IKSolverNode::fkSyncCallback, this, std::placeholders::_1));
 
@@ -188,16 +188,16 @@ public:
     kinematic_state_->update();
 
     // Publish initial home posture — synchronizes /arm_cmd and ps5_mapper FK state
-    std_msgs::msg::Float64MultiArray init_cmd;
-    init_cmd.data = current_arm_joints_;
-    init_cmd.data.push_back(last_gripper_val_);
+    std_msgs::msg::Float32MultiArray init_cmd;
+    init_cmd.data.assign(current_arm_joints_.begin(), current_arm_joints_.end());
+    init_cmd.data.push_back(static_cast<float>(last_gripper_val_));
     arm_cmd_pub_->publish(init_cmd);
     joint_sync_pub_->publish(init_cmd);
     RCLCPP_INFO(this->get_logger(), "Published initial home posture: elbow=+2.0072 rad.");
   }
 
 private:
-  void ikCmdCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+  void ikCmdCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
   {
     // Expected format: [r, theta, z, world_pitch, roll, gripper]
     if (msg->data.size() < 6) {
@@ -307,14 +307,14 @@ private:
     }
 
     // Publish unified /arm_cmd [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
-    std_msgs::msg::Float64MultiArray cmd_msg;
-    cmd_msg.data = current_arm_joints_;
-    cmd_msg.data.push_back(last_gripper_val_);
+    std_msgs::msg::Float32MultiArray cmd_msg;
+    cmd_msg.data.assign(current_arm_joints_.begin(), current_arm_joints_.end());
+    cmd_msg.data.push_back(static_cast<float>(last_gripper_val_));
     arm_cmd_pub_->publish(cmd_msg);
     joint_sync_pub_->publish(cmd_msg);
   }
 
-  void fkSyncCallback(const std_msgs::msg::Float64MultiArray::SharedPtr msg)
+  void fkSyncCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
   {
     if (msg->data.size() >= 5) {
       for (size_t i = 0; i < 5; ++i) {
@@ -366,10 +366,10 @@ private:
   const moveit::core::JointModelGroup* joint_model_group_wrist_{nullptr};
   moveit::core::RobotStatePtr kinematic_state_;
 
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr arm_cmd_pub_;
-  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr joint_sync_pub_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr ik_sub_;
-  rclcpp::Subscription<std_msgs::msg::Float64MultiArray>::SharedPtr fk_sync_sub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr arm_cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr joint_sync_pub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr ik_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr fk_sync_sub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_feedback_sub_;
 };
 
