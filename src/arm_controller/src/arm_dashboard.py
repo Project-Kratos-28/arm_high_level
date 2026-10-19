@@ -25,7 +25,7 @@ import select
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import Float64MultiArray, Float32MultiArray
+from std_msgs.msg import Float32MultiArray
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy
 from rcl_interfaces.msg import Log
@@ -177,8 +177,8 @@ class ArmDashboardNode(Node):
         self.log_messages.append((time.strftime("%H:%M:%S"), "INFO", "Arm Dashboard initialized."))
 
         # Subscriptions
-        self.create_subscription(Float64MultiArray, 'arm_cmd', self._arm_cmd_cb, 10)
-        self.create_subscription(Float64MultiArray, 'arm_ik_cmd', self._arm_ik_cmd_cb, 10)
+        self.create_subscription(Float32MultiArray, 'arm_cmd', self._arm_cmd_cb, 10)
+        self.create_subscription(Float32MultiArray, 'arm_ik_cmd', self._arm_ik_cmd_cb, 10)
         self.create_subscription(PoseStamped, 'arm_target_pose', self._target_pose_cb, 10)
         self.create_subscription(Joy, 'joy', self._joy_cb, 10)
         self.create_subscription(Float32MultiArray, 'gripper_feedback', self._gripper_cb, 10)
@@ -189,7 +189,7 @@ class ArmDashboardNode(Node):
 
     # ── Subscribers ──────────────────────────────────────────────────────────
 
-    def _arm_cmd_cb(self, msg: Float64MultiArray):
+    def _arm_cmd_cb(self, msg: Float32MultiArray):
         now = time.time()
         with self.lock:
             self.rate_arm_cmd.tick()
@@ -213,7 +213,7 @@ class ArmDashboardNode(Node):
             # Recompute live forward kinematics of physical wrist
             self._update_fk()
 
-    def _arm_ik_cmd_cb(self, msg: Float64MultiArray):
+    def _arm_ik_cmd_cb(self, msg: Float32MultiArray):
         with self.lock:
             self.rate_ik_cmd.tick()
             if len(msg.data) >= 5:

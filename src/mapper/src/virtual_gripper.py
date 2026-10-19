@@ -13,7 +13,7 @@ Autonomous virtual gripper simulation node:
 import rclpy
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from std_msgs.msg import Float64MultiArray, Float32MultiArray
+from std_msgs.msg import Float32MultiArray
 from sensor_msgs.msg import JoyFeedback
 
 
@@ -45,7 +45,7 @@ class VirtualGripperNode(Node):
 
         # ROS 2 Interfaces
         self.feedback_pub = self.create_publisher(Float32MultiArray, '/gripper_feedback', 10)
-        self.cmd_sub = self.create_subscription(Float64MultiArray, '/arm_cmd', self.cmd_callback, 10)
+        self.cmd_sub = self.create_subscription(Float32MultiArray, '/arm_cmd', self.cmd_callback, 10)
         self.rumble_sub = self.create_subscription(JoyFeedback, '/joy/set_feedback', self.rumble_callback, 10)
 
         # 50 Hz deterministic physics integration loop
@@ -61,7 +61,7 @@ class VirtualGripperNode(Node):
             f"Contact Obstacle: {self.contact_angle:.2f} rad"
         )
 
-    def cmd_callback(self, msg: Float64MultiArray):
+    def cmd_callback(self, msg: Float32MultiArray):
         """Records active momentary gripper command from /arm_cmd[5]."""
         if len(msg.data) >= 6:
             self.cmd_gripper = float(msg.data[5])

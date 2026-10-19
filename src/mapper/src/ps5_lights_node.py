@@ -20,7 +20,7 @@ from typing import Optional, Tuple, List
 
 import rclpy
 from rclpy.node import Node
-from std_msgs.msg import ColorRGBA, String, Float32, Int32, Float64MultiArray
+from std_msgs.msg import ColorRGBA, String, Float32, Int32, Float32MultiArray
 from sensor_msgs.msg import Joy, JoyFeedback
 from action_msgs.msg import GoalStatusArray, GoalStatus
 
@@ -521,7 +521,7 @@ class PS5LightsNode(Node):
             Joy, 'joy', self.joy_callback, 10
         )
         self.gripper_sub = self.create_subscription(
-            Float64MultiArray, 'gripper_state', self.gripper_callback, 10
+            Float32MultiArray, 'gripper_feedback', self.gripper_callback, 10
         )
 
         # ----- Subscriptions for Manual & CLI Light Manipulation -----
@@ -556,10 +556,10 @@ class PS5LightsNode(Node):
 
         # Subscriptions for arm command topics to double-confirm active control mode
         self.arm_cmd_sub = self.create_subscription(
-            Float64MultiArray, 'arm_cmd', self.arm_cmd_callback, 10
+            Float32MultiArray, 'arm_cmd', self.arm_cmd_callback, 10
         )
         self.arm_ik_cmd_sub = self.create_subscription(
-            Float64MultiArray, 'arm_ik_cmd', self.arm_ik_cmd_callback, 10
+            Float32MultiArray, 'arm_ik_cmd', self.arm_ik_cmd_callback, 10
         )
 
         # RTH action status subscription to automatically detect when RTH completes
@@ -649,7 +649,7 @@ class PS5LightsNode(Node):
             if self.auto_mode and self.manual_override_mode is None:
                 self._update_lighting_from_state()
 
-    def arm_cmd_callback(self, msg: Float64MultiArray):
+    def arm_cmd_callback(self, msg: Float32MultiArray):
         """Monitors arm joint command stream to detect arrival at home posture."""
         if self.rth_active and len(msg.data) >= 5:
             dist = math.hypot(*[msg.data[i] - self.HOME_JOINTS[i] for i in range(5)])
@@ -658,7 +658,7 @@ class PS5LightsNode(Node):
                 if self.auto_mode and self.manual_override_mode is None:
                     self._update_lighting_from_state()
 
-    def arm_ik_cmd_callback(self, msg: Float64MultiArray):
+    def arm_ik_cmd_callback(self, msg: Float32MultiArray):
         # IK command published means we are in IK Mode (Mode 1)
         if self.arm_mode != 1:
             self.arm_mode = 1
@@ -727,7 +727,7 @@ class PS5LightsNode(Node):
         if state_changed and self.auto_mode and self.manual_override_mode is None:
             self._update_lighting_from_state()
 
-    def gripper_callback(self, msg: Float64MultiArray):
+    def gripper_callback(self, msg: Float32MultiArray):
         """Detects load on the gripper to trigger a tactile soft cyan accent flash."""
         if len(msg.data) >= 2:
             gripping = bool(msg.data[1] > 0.5)

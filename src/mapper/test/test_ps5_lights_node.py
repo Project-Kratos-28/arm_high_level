@@ -13,7 +13,7 @@ import time
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 import rclpy
-from std_msgs.msg import ColorRGBA, String, Float32, Int32, Float64MultiArray
+from std_msgs.msg import ColorRGBA, String, Float32, Int32, Float32MultiArray
 from sensor_msgs.msg import Joy, JoyFeedback
 
 from ps5_lights_node import (
@@ -228,7 +228,7 @@ class TestPS5LightsNodeROS(unittest.TestCase):
         self.assertEqual(self.node.anim.target_player_leds, 0b00100)
 
     def test_gripper_load_triggers_accent(self):
-        msg = Float64MultiArray()
+        msg = Float32MultiArray()
         msg.data = [0.0, 0.8]  # Load = 0.8 (> 0.5)
         self.node.gripper_callback(msg)
         self.assertIsNotNone(self.node.anim.accent_color)
@@ -293,7 +293,7 @@ class TestPS5LightsNodeROS(unittest.TestCase):
         self.assertEqual(self.node.anim.target_r, 255)
 
         # 2. Arm reaches home posture
-        cmd_msg = Float64MultiArray()
+        cmd_msg = Float32MultiArray()
         cmd_msg.data = [0.0, 0.0, 2.0072, 0.0, 0.0, 0.0]
         self.node.arm_cmd_callback(cmd_msg)
 

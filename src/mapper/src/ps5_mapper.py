@@ -7,7 +7,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy, JoyFeedback
-from std_msgs.msg import Float64MultiArray, Float32MultiArray
+from std_msgs.msg import Float32MultiArray
 from rclpy.action import ActionClient
 from arm_interfaces.action import ReturnToHome
 
@@ -284,22 +284,22 @@ class PS5Mapper(Node):
 
         # Subscriber for bumpless IK -> FK joint mirroring from ik_solver_node
         self.joint_sync_sub = self.create_subscription(
-            Float64MultiArray, 'arm_joint_sync', self.joint_sync_callback, 10
+            Float32MultiArray, 'arm_joint_sync', self.joint_sync_callback, 10
         )
 
         # Arm position commands: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
         self.publisher = self.create_publisher(
-            Float64MultiArray, 'arm_cmd', 10
+            Float32MultiArray, 'arm_cmd', 10
         )
 
         # FK state sync publisher (for continuous warm-seeding of ik_solver_node during Mode 0)
         self.fk_sync_pub = self.create_publisher(
-            Float64MultiArray, 'arm_fk_sync', 10
+            Float32MultiArray, 'arm_fk_sync', 10
         )
 
         # IK target command array for IK Solver: [r, theta, z, world_pitch, roll, gripper]
         self.ik_target_pub = self.create_publisher(
-            Float64MultiArray, 'arm_ik_cmd', 10
+            Float32MultiArray, 'arm_ik_cmd', 10
         )
 
         # IK Cartesian target pose publisher (for RViz / MoveIt visualization)
@@ -419,7 +419,7 @@ class PS5Mapper(Node):
                 self.get_logger().info("EMERGENCY STOP CLEARED. Normal operation resumed.")
         self.prev_estop_btn_state = new_state
 
-    def joint_sync_callback(self, msg: Float64MultiArray):
+    def joint_sync_callback(self, msg: Float32MultiArray):
         """
         Callback for /arm_joint_sync topic published by ik_solver_node.
         Continuously mirrors the latest solved joint angles into self.target_positions
@@ -558,7 +558,7 @@ class PS5Mapper(Node):
         self.MODE = self.pre_rth_mode
 
         # Warm-seed ik_solver_node via /arm_fk_sync with the resumed posture
-        sync_msg = Float64MultiArray()
+        sync_msg = Float32MultiArray()
         sync_msg.data = list(self.target_positions)
         self.fk_sync_pub.publish(sync_msg)
 
@@ -711,13 +711,13 @@ class PS5Mapper(Node):
           - In Mode 0 (FK):
               * Integrates stick inputs into individual joint angles (self.target_positions).
               * Clamps angles to JOINT_LIMITS to prevent command windup.
-              * Publishes 6-element Float64MultiArray [J0..J4, gripper] directly to /arm_cmd.
+              * Publishes 6-element Float32MultiArray [J0..J4, gripper] directly to /arm_cmd.
           - In Mode 1 (IK):
               * Integrates stick inputs into cylindrical coordinates (r, theta, z, world_pitch, roll).
               * Clamps Cartesian state to spherical workspace envelope (WORKSPACE_RADIUS, SHOULDER_PIVOT_Z)
                 plus azimuth, world_pitch, and roll hard limits.
               * Publishes PoseStamped to /arm_target_pose for live RViz visualization.
-              * Publishes 6-element Float64MultiArray [r, theta, z, pitch, roll, gripper] to /arm_ik_cmd
+              * Publishes 6-element Float32MultiArray [r, theta, z, pitch, roll, gripper] to /arm_ik_cmd
                 (commanding ik_solver_node, which solves TRAC-IK and outputs to /arm_cmd).
           - Gripper integration runs across both modes (D-Pad Left = Open, D-Pad Right = Close).
         """
@@ -807,7 +807,7 @@ class PS5Mapper(Node):
         #          and PoseStamped to /arm_target_pose; ik_solver_node solves TRAC-IK and outputs to /arm_cmd
         if not self.rth_active:
             if self.MODE == 0:
-                cmd_msg = Float64MultiArray()
+                cmd_msg = Float32MultiArray()
                 cmd_msg.data = list(self.target_positions)
                 self.publisher.publish(cmd_msg)
                 self.fk_sync_pub.publish(cmd_msg)
@@ -846,7 +846,7 @@ class PS5Mapper(Node):
                 self.target_pose_pub.publish(pose_msg)
 
                 # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
-                ik_msg = Float64MultiArray()
+                ik_msg = Float32MultiArray()
                 ik_msg.data = [
                     float(self.target_r),
                     float(self.target_theta),

@@ -63,15 +63,15 @@ flowchart TD
 | Channel / Topic | Message / Action Type | Publisher(s) | Subscriber(s) | Frequency / QoS | Operational Role |
 |---|---|---|---|---|---|
 | `/joy` | `sensor_msgs/msg/Joy` | `joy_node` or `test_with_keyboard.py` | `ps5_mapper` | ~50–100 Hz (event-driven), Depth 10 | Raw controller analog sticks and digital button states. |
-| `/arm_cmd` | `std_msgs/msg/Float64MultiArray` | `ps5_mapper` (Mode 0)<br>`ik_solver_node` (Mode 1)<br>`rth_node` (RTH Mode) | Motor Hardware Interface / `rviz_topic_bridge` | 50 Hz, Depth 10 | The primary unified hardware actuation command: `[J0, J1, J2, J3, J4, gripper]`. Mode-gated so only one node drives the bus at any time. |
-| `/arm_ik_cmd` | `std_msgs/msg/Float64MultiArray` | `ps5_mapper` | `ik_solver_node` | 50 Hz (Mode 1 only), Depth 10 | Cartesian task-space command array: `[r, theta, z, world_pitch, roll, gripper]`. |
+| `/arm_cmd` | `std_msgs/msg/Float32MultiArray` | `ps5_mapper` (Mode 0)<br>`ik_solver_node` (Mode 1)<br>`rth_node` (RTH Mode) | Motor Hardware Interface / `rviz_topic_bridge` | 50 Hz, Depth 10 | The primary unified hardware actuation command: `[J0, J1, J2, J3, J4, gripper]`. Mode-gated so only one node drives the bus at any time. |
+| `/arm_ik_cmd` | `std_msgs/msg/Float32MultiArray` | `ps5_mapper` | `ik_solver_node` | 50 Hz (Mode 1 only), Depth 10 | Cartesian task-space command array: `[r, theta, z, world_pitch, roll, gripper]`. |
 | `/arm_target_pose` | `geometry_msgs/msg/PoseStamped` | `ps5_mapper` | RViz2 | 50 Hz (Mode 1 only), Depth 10 | 6D Cartesian target pose of `wrist_center` in `base_link` frame with auto-leveling orientation for visualization. |
-| `/arm_fk_sync` | `std_msgs/msg/Float64MultiArray` | `ps5_mapper` (Mode 0)<br>`rth_node` (RTH Mode) | `ik_solver_node` | 50 Hz, Depth 10 | Authoritative joint synchronization channel. Keeps `ik_solver_node` warm-seeded during FK manual teleop and RTH trajectory execution. |
-| `/arm_joint_sync` | `std_msgs/msg/Float64MultiArray` | `ik_solver_node` | `ps5_mapper` | 50 Hz (Mode 1 only), Depth 10 | Feedback channel mirroring TRAC-IK solved joint angles into `ps5_mapper.target_positions` for bumpless IK → FK handoffs. |
+| `/arm_fk_sync` | `std_msgs/msg/Float32MultiArray` | `ps5_mapper` (Mode 0)<br>`rth_node` (RTH Mode) | `ik_solver_node` | 50 Hz, Depth 10 | Authoritative joint synchronization channel. Keeps `ik_solver_node` warm-seeded during FK manual teleop and RTH trajectory execution. |
+| `/arm_joint_sync` | `std_msgs/msg/Float32MultiArray` | `ik_solver_node` | `ps5_mapper` | 50 Hz (Mode 1 only), Depth 10 | Feedback channel mirroring TRAC-IK solved joint angles into `ps5_mapper.target_positions` for bumpless IK → FK handoffs. |
 | `/return_to_home` | `arm_interfaces/action/ReturnToHome` | `ps5_mapper` (Client) | `rth_node` (Server) | Action Protocol | Coordinates smooth-step return to nominal folded posture with pre-flight collision gating and live progress feedback. |
 | `/joint_states` | `sensor_msgs/msg/JointState` | `rviz_topic_bridge` | `robot_state_publisher` | 50 Hz, Depth 10 | Converts 6-element `/arm_cmd` into named URDF joint states for TF forward kinematic tree resolution. |
-| `/joy/set_feedback` | `sensor_msgs/msg/JoyFeedback` | `ps5_mapper` | `joy_node` | Event-driven, Depth 10 | Commands DualSense haptic rumble based on `/gripper_state` feedback. |
-| `/gripper_state` | `std_msgs/msg/Float64MultiArray` | Gripper Hardware / Sensor | `ps5_mapper` | Event-driven, Depth 10 | Grip status and current load feedback. |
+| `/joy/set_feedback` | `sensor_msgs/msg/JoyFeedback` | `ps5_mapper` | `joy_node` | Event-driven, Depth 10 | Commands DualSense haptic rumble based on `/gripper_feedback` load. |
+| `/gripper_feedback` | `std_msgs/msg/Float32MultiArray` | `virtual_gripper` / Hardware Sensor | `ps5_mapper`<br>`ps5_lights_node`<br>`arm_dashboard` | Event-driven / 50 Hz, Depth 10 | Grip status and current load feedback: `[angle, load]`. Deprecates `/gripper_state`. |
 
 ---
 

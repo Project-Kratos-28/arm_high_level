@@ -3,7 +3,7 @@ from rclpy.node import Node
 
 from Gripper_Servo_Control.servo_control.ST3215 import ST3215
 
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float32MultiArray
 
 import sys
 import termios
@@ -48,7 +48,7 @@ class ServoTestNode(Node):
         # -------------------------------------------------
 
         self.publisher = self.create_publisher(
-            Float64MultiArray,
+            Float32MultiArray,
             '/gripper_state',
             10
         )
@@ -253,7 +253,7 @@ class ServoTestNode(Node):
         # [angle, grip]
         # -------------------------------------------------
 
-        msg = Float64MultiArray()
+        msg = Float32MultiArray()
 
         msg.data = [
             float(self.angle),

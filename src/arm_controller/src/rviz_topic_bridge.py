@@ -3,7 +3,7 @@
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
+from std_msgs.msg import Float32MultiArray
 
 
 class RvizTopicBridge(Node):
@@ -29,12 +29,12 @@ class RvizTopicBridge(Node):
 
         # Commanded joint positions subscriber
         self.arm_cmd_sub = self.create_subscription(
-            Float64MultiArray, 'arm_cmd', self.arm_cmd_callback, 10
+            Float32MultiArray, 'arm_cmd', self.arm_cmd_callback, 10
         )
 
         self.get_logger().info("Rviz Topic Bridge started (/arm_cmd -> /joint_states).")
 
-    def arm_cmd_callback(self, msg: Float64MultiArray):
+    def arm_cmd_callback(self, msg: Float32MultiArray):
         """Immediately converts and publishes /arm_cmd messages onto /joint_states."""
         if len(msg.data) < 6:
             self.get_logger().warn(
