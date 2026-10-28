@@ -5,7 +5,10 @@
   <version>0.0.1</version>
   <description>Custom ROS 2 action interfaces for the robotic arm</description>
   <maintainer email="wizard1net@gmail.com">Shlok</maintainer>
-  <license>TODO</license>
+  <license>Apache-2.0</license>
+
+  <url type="repository">https://github.com/Project-Kratos-28/arm_high_level.git</url>
+  <url type="bugtracker">https://github.com/Project-Kratos-28/arm_high_level/issues</url>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
   <buildtool_depend>rosidl_default_generators</buildtool_depend>

@@ -2,10 +2,13 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>ik_motion_planner</name>
-  <version>0.0.0</version>
+  <version>0.0.1</version>
   <description>TODO: Package description</description>
-  <maintainer email="wizard1net+github@gmail.com">kratos</maintainer>
-  <license>TODO: License declaration</license>
+  <maintainer email="wizard1net@gmail.com">Shlok</maintainer>
+  <license>Apache-2.0</license>
+
+  <url type="repository">https://github.com/Project-Kratos-28/arm_high_level.git</url>
+  <url type="bugtracker">https://github.com/Project-Kratos-28/arm_high_level/issues</url>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
