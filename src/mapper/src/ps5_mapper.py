@@ -414,7 +414,7 @@ class PS5Mapper(Node):
                 # If RTH is active, cancel it immediately
                 if self.rth_active:
                     self.get_logger().warn("E-Stop during RTH: canceling RTH goal.")
-                    self._cancel_rth_goal()
+                    self._cancel_rth_goal(reason="estop")
             else:
                 self.get_logger().info("EMERGENCY STOP CLEARED. Normal operation resumed.")
         self.prev_estop_btn_state = new_state
@@ -537,13 +537,21 @@ class PS5Mapper(Node):
         for i in range(5):
             self.target_positions[i] = joints[i]
 
-    def _cancel_rth_goal(self):
+    def _cancel_rth_goal(self, reason: str = "operator"):
         """Sends a cancellation request to rth_node. Result callback handles bumpless resume."""
-        self.get_logger().info("[RTH] Cancellation requested by operator.")
+        if reason == "comms_loss":
+            self.get_logger().error(
+                "[RTH SAFETY LOCKDOWN] Joystick signal lost during active RTH! Preempting homing trajectory."
+            )
+        elif reason == "estop":
+            self.get_logger().warn("[RTH] Cancellation requested due to Emergency Stop.")
+        else:
+            self.get_logger().info("[RTH] Cancellation requested by operator.")
+
         if self._rth_goal_handle is not None:
             cancel_future = self._rth_goal_handle.cancel_goal_async()
             cancel_future.add_done_callback(
-                lambda _: self.get_logger().info("[RTH] Cancel request sent to rth_node."))
+                lambda _: self.get_logger().info(f"[RTH] Cancel request sent to rth_node (reason: {reason})."))
         else:
             # No active goal handle — just reset state immediately
             self._rth_bumpless_resume()
@@ -873,6 +881,19 @@ class PS5Mapper(Node):
             self.get_logger().warn(
                 f"Joy input timed out ({elapsed_sec:.2f}s > {timeout}s). Position held."
             )
+
+            # --- RTH Safety Lockdown Interlock ---
+            # Immediately abort RTH trajectory and freeze joints if controller comms drop
+            if self.rth_active:
+                # TODO: Implement a smooth S-curve deceleration stop over 1.0–2.0 seconds
+                #       instead of an immediate setpoint freeze.
+                #       Architecture roadmap:
+                #         1. In rth_node.cpp, when cancel is requested with reason='comms_loss',
+                #            sample current joint velocities (dq_i = delta_i * d/ds(smooth_s) * 1/T).
+                #         2. Plan a cubic or quintic polynomial braking ramp over T_stop = 1.0–2.0s
+                #            ensuring d^2q/dt^2 does not exceed joint_limits.yaml max_acceleration.
+                #         3. Stream braking waypoints to /arm_cmd until dq -> 0, then complete cancel.
+                self._cancel_rth_goal(reason="comms_loss")
 
     def trigger_limit_rumble(self):
         """Triggers a 200 ms momentary tactile rumble at 80% intensity for limit contact."""
