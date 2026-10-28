@@ -572,19 +572,19 @@ class ArmDashboardNode(Node):
         ground_angles = [
             math.degrees(q[0]),                                             # J0: Base Yaw (Azimuth)
             90.0 - math.degrees(q[1]),                                      # J1: Shoulder (Elevation)
-            -math.degrees(q[1] + q[2] - 2.00719),                           # J2: Elbow (Forearm)
-            -math.degrees(q[1] + q[2] - 2.00719 + q[3] + 0.4363323),        # J3: Wrist (Horizon)
+            -math.degrees(q[1] + q[2] - 2.00719 + 0.4363323),               # J2: Elbow (Forearm Pitch wrt ground)
+            -math.degrees(q[1] + q[2] - 2.00719 + q[3] + 0.4363323),        # J3: Wrist (Horizon Pitch wrt ground)
             math.degrees(q[4]),                                             # J4: Wrist Roll
             math.degrees(self.gripper_angle),                               # J5: Gripper
         ]
 
         ground_labels = [
-            f"{ground_angles[0]:+6.1f}° (Azimuth)",
-            f"{ground_angles[1]:+6.1f}° (Elevation)",
-            f"{ground_angles[2]:+6.1f}° (Forearm)",
-            f"{ground_angles[3]:+6.1f}° (Horizon)",
-            f"{ground_angles[4]:+6.1f}° (Roll)",
-            f"{gripper_pct:3d}% Open ({ground_angles[5]:.1f}°)",
+            f"{ground_angles[0]:+6.1f}°",
+            f"{ground_angles[1]:+6.1f}°",
+            f"{ground_angles[2]:+6.1f}°",
+            f"{ground_angles[3]:+6.1f}°",
+            f"{ground_angles[4]:+6.1f}°",
+            f"{ground_angles[5]:+6.1f}° ({gripper_pct}% Open)",
         ]
 
         bar_width = 13 if not expanded else 21
