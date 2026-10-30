@@ -1,58 +1,32 @@
 import os
 import shutil
-import yaml
-from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.conditions import IfCondition
-from launch.substitutions import Command, FindExecutable, LaunchConfiguration
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.parameter_descriptions import ParameterValue
 
 
 def get_terminal_prefix():
     """Detects available terminal emulator to spawn popup window without cluttering launch logs."""
     if shutil.which("gnome-terminal"):
-        return "gnome-terminal --geometry=130x35 --title='Arm Telemetry Dashboard' --"
+        return "gnome-terminal --geometry=120x30 --title='Arm Velocity Telemetry Dashboard' --"
     elif shutil.which("terminator"):
-        return "terminator -T 'Arm Telemetry Dashboard' --geometry=1040x600 -x"
+        return "terminator -T 'Arm Velocity Telemetry Dashboard' --geometry=960x500 -x"
     elif shutil.which("xterm"):
-        return "xterm -geometry 130x35 -title 'Arm Telemetry Dashboard' -hold -e"
+        return "xterm -geometry 120x30 -title 'Arm Velocity Telemetry Dashboard' -e"
     elif shutil.which("alacritty"):
-        return "alacritty --title 'Arm Telemetry Dashboard' -e"
+        return "alacritty --title 'Arm Velocity Telemetry Dashboard' -e"
     elif shutil.which("konsole"):
-        return "konsole --title 'Arm Telemetry Dashboard' -e"
+        return "konsole --title 'Arm Velocity Telemetry Dashboard' -e"
     elif shutil.which("xfce4-terminal"):
-        return "xfce4-terminal --title='Arm Telemetry Dashboard' -x"
+        return "xfce4-terminal --title='Arm Velocity Telemetry Dashboard' -x"
     return ""
 
 
-def load_yaml(package_name, file_path):
-    package_path = get_package_share_directory(package_name)
-    absolute_file_path = os.path.join(package_path, file_path)
-    try:
-        with open(absolute_file_path, "r") as file:
-            return yaml.safe_load(file)
-    except EnvironmentError:
-        return None
-
-
-def load_file(package_name, file_path):
-    package_path = get_package_share_directory(package_name)
-    absolute_file_path = os.path.join(package_path, file_path)
-    try:
-        with open(absolute_file_path, "r") as file:
-            return file.read()
-    except EnvironmentError:
-        return None
-
-
 def generate_launch_description():
-    pkg_arm_controller = get_package_share_directory("arm_controller")
-
     # Launch Arguments
     use_sim_time = LaunchConfiguration("use_sim_time")
-    launch_rviz = LaunchConfiguration("rviz")
     launch_dashboard = LaunchConfiguration("dashboard")
     launch_lights = LaunchConfiguration("lights")
 
@@ -61,59 +35,18 @@ def generate_launch_description():
         default_value="false",
         description="Use simulation clock if true",
     )
-    declare_rviz = DeclareLaunchArgument(
-        "rviz",
-        default_value="false",
-        description="Launch RViz visualization, robot_state_publisher, and rviz_topic_bridge",
-    )
     declare_dashboard = DeclareLaunchArgument(
         "dashboard",
         default_value="false",
-        description="Launch the live arm telemetry dashboard in a dedicated popup window",
+        description="Launch live arm velocity telemetry dashboard in a dedicated popup window",
     )
     declare_lights = DeclareLaunchArgument(
         "lights",
-        default_value="true",
-        description="Launch PS5 controller lights manipulation and mode telemetry node",
+        default_value="false",
+        description="Launch PS5 controller lighting and mode telemetry node",
     )
 
-    # 1. Robot Description (URDF from xacro)
-    xacro_file = os.path.join(pkg_arm_controller, "urdf", "arm_cad.urdf.xacro")
-    robot_description_content = ParameterValue(
-        Command([FindExecutable(name="xacro"), " ", xacro_file]),
-        value_type=str,
-    )
-    robot_description = {"robot_description": robot_description_content}
-
-    # 2. Semantic Robot Description (SRDF)
-    robot_description_semantic_content = load_file("arm_controller", "config/arm.srdf")
-    robot_description_semantic = {
-        "robot_description_semantic": robot_description_semantic_content
-    }
-
-    # 3. Kinematics YAML (TRAC-IK config)
-    kinematics_yaml = load_yaml("arm_controller", "config/kinematics.yaml")
-    robot_description_kinematics = {
-        "robot_description_kinematics": kinematics_yaml
-    }
-
-    # 4. Joint Limits YAML
-    joint_limits_yaml = load_yaml("arm_controller", "config/joint_limits.yaml")
-    robot_description_planning = {
-        "robot_description_planning": joint_limits_yaml
-    }
-
-    # Node: robot_state_publisher
-    rsp_node = Node(
-        package="robot_state_publisher",
-        executable="robot_state_publisher",
-        name="robot_state_publisher",
-        output="screen",
-        parameters=[robot_description, {"use_sim_time": use_sim_time}],
-        condition=IfCondition(launch_rviz),
-    )
-
-    # Node: joy_node (Joystick driver)
+    # Node: joy_node (Reads PS5 DualSense controller)
     joy_node = Node(
         package="joy",
         executable="joy_node",
@@ -122,16 +55,22 @@ def generate_launch_description():
         parameters=[{"use_sim_time": use_sim_time}],
     )
 
-    # Node: ps5_mapper (teleoperation)
+    # Node: ps5_mapper (Direct FK velocity mapper -> /arm_cmd [-255, 255])
     mapper_node = Node(
         package="mapper",
         executable="ps5_mapper",
         name="ps5_mapper",
         output="screen",
-        parameters=[{"use_sim_time": use_sim_time}],
+        parameters=[
+            {
+                "use_sim_time": use_sim_time,
+                "invert_j0": True,
+                "invert_j4": True,
+            }
+        ],
     )
 
-    # Node: ps5_lights_node (PS5 controller lights manipulation & mode telemetry)
+    # Node: ps5_lights_node (Optional controller lighting)
     lights_node = Node(
         package="mapper",
         executable="ps5_lights_node",
@@ -141,78 +80,7 @@ def generate_launch_description():
         condition=IfCondition(launch_lights),
     )
 
-    # Node: ik_solver_node (TRAC-IK MoveIt 2 Solver)
-    ik_solver_node = Node(
-        package="ik_motion_planner",
-        executable="ik_solver_node",
-        name="ik_solver_node",
-        output="screen",
-        parameters=[
-            robot_description,
-            robot_description_semantic,
-            robot_description_kinematics,
-            robot_description_planning,
-            {
-                "planning_group": "arm",
-                "base_frame": "base_link",
-                "tip_frame": "tool0",
-                "wrist_planning_group": "arm_wrist",
-                "wrist_tip_frame": "wrist_center",
-                "ik_timeout": 0.001,
-                "use_live_joint_states": False,
-                "use_sim_time": use_sim_time,
-            },
-        ],
-    )
-
-    # Node: rth_node (Return-to-Home smooth joint interpolator with MoveIt 2 validation)
-    rth_node = Node(
-        package="ik_motion_planner",
-        executable="rth_node",
-        name="rth_node",
-        output="screen",
-        parameters=[
-            robot_description,
-            robot_description_semantic,
-            robot_description_kinematics,
-            robot_description_planning,
-            {
-                "max_joint_speed": 0.15,
-                "control_rate": 50.0,
-                "collision_check_points": 10,
-                "use_sim_time": use_sim_time,
-            },
-        ],
-    )
-
-    # Node: RViz2
-    rviz_config_file = os.path.join(pkg_arm_controller, "config", "moveit.rviz")
-    rviz_node = Node(
-        package="rviz2",
-        executable="rviz2",
-        name="rviz2",
-        output="log",
-        arguments=["-d", rviz_config_file],
-        parameters=[
-            robot_description,
-            robot_description_semantic,
-            robot_description_kinematics,
-            {"use_sim_time": use_sim_time},
-        ],
-        condition=IfCondition(launch_rviz),
-    )
-
-    # Node: rviz_topic_bridge (/arm_cmd -> /joint_states for RViz)
-    bridge_node = Node(
-        package="arm_controller",
-        executable="rviz_topic_bridge.py",
-        name="rviz_topic_bridge",
-        output="screen",
-        parameters=[{"use_sim_time": use_sim_time}],
-        condition=IfCondition(launch_rviz),
-    )
-
-    # Node: arm_dashboard (Live telemetry dashboard spawned in dedicated popup window)
+    # Node: arm_dashboard (Live PWM velocity telemetry dashboard)
     dashboard_prefix = get_terminal_prefix()
     dashboard_node = Node(
         package="arm_controller",
@@ -228,17 +96,11 @@ def generate_launch_description():
     return LaunchDescription(
         [
             declare_use_sim_time,
-            declare_rviz,
             declare_dashboard,
             declare_lights,
-            rsp_node,
-            bridge_node,
             joy_node,
             mapper_node,
             lights_node,
-            ik_solver_node,
-            rth_node,
-            rviz_node,
             dashboard_node,
         ]
     )

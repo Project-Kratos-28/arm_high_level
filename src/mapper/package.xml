@@ -3,7 +3,7 @@
 <package format="3">
   <name>mapper</name>
   <version>0.0.1</version>
-  <description>PS5 teleoperation node for mode switching and arm mapping</description>
+  <description>Rudimentary FK velocity teleoperation node for PS5 controller</description>
   <maintainer email="wizard1net@gmail.com">Shlok</maintainer>
   <license>Apache-2.0</license>
 
@@ -15,8 +15,6 @@
   <exec_depend>rclpy</exec_depend>
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>std_msgs</exec_depend>
-  <exec_depend>geometry_msgs</exec_depend>
-  <exec_depend>arm_interfaces</exec_depend>
 
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>

@@ -1,22 +1,50 @@
 #!/usr/bin/env python3
+"""
+ps5_mapper.py - Rudimentary FK Velocity Teleoperation Node for PS5 DualSense Controller.
 
-import math
-import numpy as np
-from scipy.spatial.transform import Rotation as R
+Translates PlayStation 5 controller inputs into direct forward kinematics (FK) velocity / PWM commands
+for an embedded micro-ROS STM32 motor driver bridge.
+
+Control Pipeline:
+    PS5 (DualSense) -> joy_node -> ps5_mapper -> /arm_cmd (Int16MultiArray [J0..J4] ∈ [-255, 255])
+                    -> micro-ROS Agent -> STM32 -> Motor Drivers -> Arm Motors
+
+Outputs:
+    /arm_cmd (std_msgs/msg/Int16MultiArray):
+        A 5-element array of integers [-255, 255]:
+        -255 = max speed in reverse polarity
+           0 = stopped / neutral
+        +255 = max speed in forward polarity
+
+Joint Assignments:
+    - J0 (Base Yaw): Left Stick X
+    - J1 (Shoulder Pitch): Left Stick Y
+    - J2 (Elbow Pitch): Right Stick Y (default layer, RB unpressed)
+    - J3 (Wrist Pitch): Right Stick Y (wrist layer, RB held)
+    - J4 (Wrist Roll): Right Stick X (wrist layer, RB held)
+
+Features & Safety:
+    - Dominant-Axis Locking on Left Stick (eliminates accidental diagonal cross-talk)
+    - Right Bumper (RB) layer toggle for Wrist Gimbal (J3 Pitch / J4 Roll) vs Elbow (J2 Pitch)
+    - Left Bumper (LB) Precision Crawl mode (scales speeds by precision_scale, default 30% / ±76)
+    - Emergency Stop Latch on PS Button (latches output to [0, 0, 0, 0, 0])
+    - Heartbeat Watchdog Timer (auto-zeros output to [0, 0, 0, 0, 0] on joy disconnect / >0.2s timeout)
+    - Per-joint configurable polarity inversion (invert_j0 .. invert_j4)
+    - Per-joint configurable max speed clamp (max_j0_speed .. max_j4_speed)
+    - Deterministic 50 Hz control loop
+"""
+
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
 from sensor_msgs.msg import Joy, JoyFeedback
-from std_msgs.msg import Float32MultiArray
-from rclpy.action import ActionClient
-from arm_interfaces.action import ReturnToHome
+from std_msgs.msg import Int16MultiArray
 
 
 class StickAxisLock:
     """
     Filters 2-axis joystick input by locking onto the dominant axis once moved outside
-    the deadzone, while allowing clean dynamic switching when the user deliberately deflects
-    the secondary axis. Prevents accidental diagonal cross-talk without locking the user out.
+    the deadzone, while allowing clean dynamic switching when the operator deliberately
+    deflects the secondary axis. Prevents accidental diagonal cross-talk.
     """
 
     def __init__(self):
@@ -51,52 +79,10 @@ class StickAxisLock:
             return (x if abs_x > deadzone else 0.0), 0.0
 
 
-def _t_mat(rot=None, trans=(0.0, 0.0, 0.0)):
-    """Constructs a 4x4 homogeneous transformation matrix."""
-    T = np.eye(4)
-    if rot is not None:
-        T[:3, :3] = rot.as_matrix()
-    T[:3, 3] = trans
-    return T
-
-
 class PS5Mapper(Node):
     """
-    ROS 2 teleoperation node for PS5 DualSense controller mapping to /arm_cmd (joint commands),
-    /arm_ik_cmd (Cartesian targets for MoveIt TRAC-IK solver), /arm_target_pose (RViz visualization),
-    and /joy/set_feedback (DualSense haptic rumble).
-
-    Features:
-      - Dual-Mode Teleoperation (toggled via OPTIONS button):
-          * Mode 0 (FK): Joint-by-joint angle integration published directly to /arm_cmd,
-            with continuous mirroring to /arm_fk_sync for solver warm-seeding.
-          * Mode 1 (IK): Cylindrical Cartesian control of wrist_center (end of Link 2) published to /arm_ik_cmd.
-      - Dynamic Leash Anti-Windup (25 mm limit clamp):
-          * Clamps Cartesian targets within 25 mm of the actual reached wrist position when pushing against
-            workspace boundaries, preventing the target frame from drifting away and ensuring instant reversal.
-      - Bumpless Bidirectional State Synchronization:
-          * FK -> IK: Analytical 3D Forward Kinematics to wrist_center initializes Cartesian targets
-            (r, theta, z, world_pitch, roll) directly from the current physical joint configuration.
-          * IK -> FK: Continuously mirrors solved joint angles from /arm_joint_sync while in IK mode,
-            allowing immediate and seamless resumption of joint-level control with zero jump.
-      - World-Space Auto-Leveling Orientation:
-          * Maintains gripper pitch relative to ground horizon across translations in IK mode.
-          * Right Bumper (RB) toggles the Right Stick to control World Pitch and Axial Wrist Roll.
-      - Deterministic 50 Hz Position Integration Loop.
-      - Dominant-Axis Locking (eliminates accidental diagonal stick cross-talk).
-      - Momentary Gripper Control on D-Pad Left/Right (Left = Open [+1.0], Right = Close [-1.0], Neutral = [0.0]).
-      - Gripper Feedback on /gripper_feedback (Float32MultiArray: [angle, load]).
-      - Live Joint & Cartesian Speed Trimming via Shape Buttons + Triggers (LT/RT):
-          * CROSS (Hold)    + RT/LT -> Base Yaw (FK) / Azimuth (IK) Max Speed (+/-)
-          * SQUARE (Hold)   + RT/LT -> Shoulder Pitch (FK) / Reach (IK) Max Speed (+/-)
-          * CIRCLE (Hold)   + RT/LT -> Elbow Pitch (FK) / Elevation (IK) Max Speed (+/-)
-          * TRIANGLE (Hold) + RT/LT -> Wrist Pitch & Roll (FK/IK) Max Speed (+/-)
-      - Precision Crawl Mode (Left Bumper LB scales speeds to 30%).
-      - Software Emergency Stop Lock (PS Button toggles latched motion halt).
-      - Signal Loss Watchdog Timer (holds target positions on disconnect / >0.2s timeout).
+    ROS 2 teleoperation node mapping PS5 DualSense inputs directly to 5-joint velocity commands.
     """
-
-    MODE = 0  # 0: FK, 1: IK
 
     # Axis indices for PS5 controller on /joy
     LJOY_X = 0
@@ -109,892 +95,261 @@ class PS5Mapper(Node):
     DPAD_Y = 7
 
     # Button indices for PS5 controller on /joy
-    CROSS    = 0  # Bottom (Base Yaw / Azimuth)
-    CIRCLE   = 1  # Right  (Elbow Pitch / Elevation)
-    TRIANGLE = 2  # Top    (Wrist / World Pitch & Roll)
-    SQUARE   = 3  # Left   (Shoulder Pitch / Reach)
-    LB       = 4  # Precision Crawl (30%)
-    RB       = 5  # Layer Toggle (Wrist Gimbal / World Orientation)
+    CROSS    = 0
+    CIRCLE   = 1
+    TRIANGLE = 2
+    SQUARE   = 3
+    LB       = 4   # Precision Crawl (30%)
+    RB       = 5   # Wrist Gimbal Layer Toggle
     LT_BTN   = 6
     RT_BTN   = 7
     SHARE    = 8
-    OPTIONS  = 9  # Mode Toggle (FK <-> IK)
-    PS_BTN   = 10 # Emergency Stop Lock Latch
+    OPTIONS  = 9
+    PS_BTN   = 10  # Emergency Stop Latch
     LJOY_BTN = 11
     RJOY_BTN = 12
-
-    DEADZONE = 0.1
-
-    # Home positions (radians) — elbow at +2.0072 rad (115° forward from straight-up reference)
-    HOME_POSITIONS = [0.0, 0.0, 2.0072, 0.0, 0.0, 0.0]
-    # Index mapping: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
-
-    # Software joint limits (min, max) in radians — prevents command windup
-    JOINT_LIMITS = [
-        (-3.14,  3.14),   # 0: Base Yaw        (±180°)
-        (-1.57,  1.57),   # 1: Shoulder Pitch  (±90°)
-        ( 0.00,  2.50),   # 2: Elbow Pitch     (0 to +143.2°) — prevents backward elbow bending
-        (-1.57,  1.57),   # 3: Wrist Pitch     (±90°)
-        (-3.14,  3.14),   # 4: Wrist Roll      (±180°)
-        ( 0.00,  1.57),   # 5: Gripper         (0 to +90°, matches URDF)
-    ]
-
-    # Kinematic mounting constants for wrist_center relative to base_link
-    BASE_PIVOT_X       = 0.043511       # Base yaw rotation axis X (m)
-    BASE_PIVOT_Y       = -0.012448      # Base yaw rotation axis Y (m)
-    BASE_PIVOT_Z       = 0.03425        # Base yaw joint Z elevation (m)
-    ARM_LATERAL_OFFSET = -0.023         # Arm sagittal lateral offset in rotating frame (m)
-
-    # Cartesian workspace limits (min, max) in meters / radians for wrist_center (end of Link 2):
-    REACH_LIMITS       = (0.04, 0.98)   # Forward sagittal reach (m) from shoulder to wrist_center
-    ELEV_LIMITS        = (-0.45, 1.08)  # Elevation (m) from base to wrist_center
-    AZIMUTH_LIMITS     = (-3.14, 3.14)  # Base azimuth (rad) (±180°, 0 = forward, + = CCW, - = CW)
-    WORLD_PITCH_LIMITS = (-1.57, 1.57)  # World pitch (rad) relative to horizon (0=horizontal)
-    ROLL_LIMITS        = (-3.14, 3.14)  # Wrist axial roll (rad) (±180°)
-
-    # Spherical workspace envelope for wrist_center
-    # Model: sphere centered at (r=0, z=SHOULDER_PIVOT_Z) with radius WORKSPACE_RADIUS.
-    SHOULDER_PIVOT_Z   = 0.1385         # Exact shoulder joint pivot elevation (m) in base_link
-    WORKSPACE_RADIUS   = 0.98           # Spherical workspace radius (m) to wrist_center (physical max: 0.990 m)
-    LEASH_MAX_M        = 0.025          # 25 mm max visual lead in 3D (dynamic leash anti-windup)
-
-    # Initial Cartesian home state (r, theta, z, world_pitch, roll) for wrist_center
-    # Home posture at q=[0,0,2.0072,0,0,0]: forward reach r=0.4775m, theta=0.0rad (forward), z=0.3315m
-    HOME_CARTESIAN = {
-        'r': 0.4775,
-        'theta': 0.0,
-        'z': 0.3315,
-        'world_pitch': -0.4363,
-        'roll': 0.0
-    }
-
-    # Control loop rate
-    CONTROL_RATE = 50.0   # Hz
-    DT = 1.0 / CONTROL_RATE
 
     def __init__(self):
         super().__init__('ps5_mapper')
 
-        self.prev_mode_btn_state = 0                        # IK/FK toggle button state
-        self.prev_estop_btn_state = 0                       # EStop button state
-        self.e_stop_active = False                          # EStop state
-        # ----- Return-to-Home (RTH) State -----
-        self.rth_active = False                             # True while RTH is executing
-        self.prev_rth_btn_state = 0                        # Rising-edge detection for SHARE
-        self.pre_rth_mode = 0                              # Mode to resume after RTH (0=FK, 1=IK)
-        self._rth_goal_handle = None                       # Active action goal handle
+        # ----- Declare ROS 2 Parameters -----
+        self.declare_parameter('deadzone', 0.10)
+        self.declare_parameter('precision_scale', 0.30)
+        self.declare_parameter('axis_lock_enabled', True)
+        self.declare_parameter('watchdog_timeout', 0.20)
+        self.declare_parameter('watchdog_rate', 10.0)
+        self.declare_parameter('control_rate', 50.0)
 
-        # Axis-locking filter for Left Stick
+        # Configurable joint polarity inversions (J0 Base Yaw & J4 Wrist Roll inverted)
+        self.declare_parameter('invert_j0', True)
+        self.declare_parameter('invert_j1', False)
+        self.declare_parameter('invert_j2', False)
+        self.declare_parameter('invert_j3', False)
+        self.declare_parameter('invert_j4', True)
+        self.declare_parameter('invert_gripper', False)
+
+        # Configurable max speeds (clamped to [-255, 255])
+        self.declare_parameter('max_j0_speed', 255)
+        self.declare_parameter('max_j1_speed', 255)
+        self.declare_parameter('max_j2_speed', 255)
+        self.declare_parameter('max_j3_speed', 255)
+        self.declare_parameter('max_j4_speed', 255)
+        self.declare_parameter('gripper_speed', 128)
+
+        # Cache parameter values
+        self.deadzone = float(self.get_parameter('deadzone').value)
+        self.precision_scale = float(self.get_parameter('precision_scale').value)
+        self.axis_lock_enabled = bool(self.get_parameter('axis_lock_enabled').value)
+        self.watchdog_timeout = float(self.get_parameter('watchdog_timeout').value)
+
+        # Left stick dominant axis filter
         self.left_stick_lock = StickAxisLock()
 
-        # ----- ROS 2 Parameters -----
-        self.declare_parameter('deadzone', self.DEADZONE)
+        # Teleop state
+        self.e_stop_active = False
+        self.prev_estop_btn_state = 0
+        self.signal_lost = False
+        self.last_joy_time = None
 
-        self.declare_parameter('trim_min_bound', 0.02)      # Minimum trim speed clamp          (rad/s)
-        self.declare_parameter('trim_max_bound', 0.50)      # Maximum trim speed clamp          (rad/s)
-        self.declare_parameter('speed_step', 0.02)          # Increment step for speed trimming (rad/s)
+        # Filtered stick & button states
+        self.lx = 0.0
+        self.ly = 0.0
+        self.rx = 0.0
+        self.ry = 0.0
+        self.lb_held = False
+        self.rb_held = False
+        self.gripper_cmd = 0
 
-        self.declare_parameter('precision_scale', 0.3)      # Speed multiplier when holding LB  (30%)
+        # Current command array [J0, J1, J2, J3, J4, Gripper]
+        self.cmd_output = [0, 0, 0, 0, 0, 0]
 
-        self.declare_parameter('axis_lock_enabled', True)   # Enable dominant-axis locking filter
-
-        self.declare_parameter('watchdog_timeout', 0.2)     # Duration before signal-lost flag
-        self.declare_parameter('watchdog_rate', 10.0)       # Watchdog check frequency (Hz)
-
-        # Configurable joint speeds (FK Mode)
-        self.declare_parameter('max_base_speed', 0.1)       # Base Yaw max speed                (rad/s)
-        self.declare_parameter('max_shoulder_speed', 0.1)   # Shoulder Pitch max speed          (rad/s)
-        self.declare_parameter('max_elbow_speed', 0.1)      # Elbow Pitch max speed             (rad/s)
-        self.declare_parameter('max_wrist_speed', 0.1)      # Wrist Pitch/Roll max speed        (rad/s)
-        self.declare_parameter('max_gripper_speed', 0.1)    # Gripper max speed                 (rad/s)
-
-        # Configurable Cartesian speeds (IK Mode)
-        self.declare_parameter('max_reach_speed', 0.10)       # Radial reach max speed          (m/s)
-        self.declare_parameter('max_elev_speed', 0.10)        # Vertical elevation max speed    (m/s)
-        self.declare_parameter('max_azimuth_speed', 0.20)     # Base azimuth max speed          (rad/s)
-        self.declare_parameter('max_world_pitch_speed', 0.20) # World pitch max speed           (rad/s)
-        self.declare_parameter('max_roll_speed', 0.30)        # Wrist roll max speed            (rad/s)
-
-        # Dynamic runtime joint max speed values
-        self.max_base_speed = self.get_parameter('max_base_speed').value
-        self.max_shoulder_speed = self.get_parameter('max_shoulder_speed').value
-        self.max_elbow_speed = self.get_parameter('max_elbow_speed').value
-        self.max_wrist_speed = self.get_parameter('max_wrist_speed').value
-        self.max_gripper_speed = self.get_parameter('max_gripper_speed').value
-
-        # Cached read-only parameters (constant throughout node lifetime)
-        self.deadzone = self.get_parameter('deadzone').value
-        self.precision_scale = self.get_parameter('precision_scale').value
-        self.trim_min_bound = self.get_parameter('trim_min_bound').value
-        self.trim_max_bound = self.get_parameter('trim_max_bound').value
-        self.speed_step = self.get_parameter('speed_step').value
-        self.axis_lock_enabled = self.get_parameter('axis_lock_enabled').value
-        self.watchdog_timeout = self.get_parameter('watchdog_timeout').value
-
-        # Dynamic runtime Cartesian max speed values
-        self.max_reach_speed = self.get_parameter('max_reach_speed').value
-        self.max_elev_speed = self.get_parameter('max_elev_speed').value
-        self.max_azimuth_speed = self.get_parameter('max_azimuth_speed').value
-        self.max_world_pitch_speed = self.get_parameter('max_world_pitch_speed').value
-        self.max_roll_speed = self.get_parameter('max_roll_speed').value
-
-        # ----- Target Joint Position State (FK & Gripper) -----
-        self.target_positions = list(self.HOME_POSITIONS)
-
-        # ----- Target Cartesian State (IK Mode) -----
-        self.target_r = self.HOME_CARTESIAN['r']
-        self.target_theta = self.HOME_CARTESIAN['theta']
-        self.target_z = self.HOME_CARTESIAN['z']
-        self.target_world_pitch = self.HOME_CARTESIAN['world_pitch']
-        self.target_roll = self.HOME_CARTESIAN['roll']
-
-        # ----- Shared Input State (written by joy_callback, read by control_loop) -----
-        self.lx = 0.0               # Left stick X (filtered)
-        self.ly = 0.0               # Left stick Y (filtered)
-        self.rx = 0.0               # Right stick X (filtered)
-        self.ry = 0.0               # Right stick Y (filtered)
-        self.dpad_x = 0.0           # D-Pad X axis (gripper open/close)
-        self.lb_held = False        # Left bumper state
-        self.rb_held = False        # Right bumper state
-        self.is_tuning_speed = False  # True while shape button is held (arm lockout)
-        self.signal_lost = False    # Set by watchdog on timeout
-
-        # ----- Speed Trimming Timing State (Arm Joints) -----
-        self.last_trim_time = 0.0
-        self.trim_held_start_time = 0.0
-        self.prev_lt_active = False
-        self.prev_rt_active = False
-
-        # ----- Gripper Feedback & Limit Rumble State -----
-        self.gripper_feedback_angle = 0.0
-        self.gripper_feedback_load = 0.0
-        self.limit_rumble_until = 0.0
-        self.was_at_min_limit = False
-        self.was_at_max_limit = False
-        self.prev_dpad_x = 0.0
-
-        # ----- Subscriptions -----
-        self.subscription = self.create_subscription(
+        # ----- Subscriptions & Publishers -----
+        self.joy_sub = self.create_subscription(
             Joy, 'joy', self.joy_callback, 10
         )
 
-        self.grip_feedback_subscription = self.create_subscription(
-            Float32MultiArray, 'gripper_feedback', self.grip_feedback_callback, 10
+        self.cmd_pub = self.create_publisher(
+            Int16MultiArray, 'arm_cmd', 10
         )
 
-        # Subscriber for bumpless IK -> FK joint mirroring from ik_solver_node
-        self.joint_sync_sub = self.create_subscription(
-            Float32MultiArray, 'arm_joint_sync', self.joint_sync_callback, 10
-        )
-
-        # Arm position commands: [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, gripper]
-        self.publisher = self.create_publisher(
-            Float32MultiArray, 'arm_cmd', 10
-        )
-
-        # FK state sync publisher (for continuous warm-seeding of ik_solver_node during Mode 0)
-        self.fk_sync_pub = self.create_publisher(
-            Float32MultiArray, 'arm_fk_sync', 10
-        )
-
-        # IK target command array for IK Solver: [r, theta, z, world_pitch, roll, gripper]
-        self.ik_target_pub = self.create_publisher(
-            Float32MultiArray, 'arm_ik_cmd', 10
-        )
-
-        # IK Cartesian target pose publisher (for RViz / MoveIt visualization)
-        self.target_pose_pub = self.create_publisher(
-            PoseStamped, 'arm_target_pose', 10
-        )
-
-        self.feedback_publisher = self.create_publisher(
+        self.feedback_pub = self.create_publisher(
             JoyFeedback, '/joy/set_feedback', 10
         )
 
         # ----- Timers -----
-        # Watchdog (10 Hz)
-        self.last_joy_time = None
-        watchdog_period = 1.0 / self.get_parameter('watchdog_rate').value
+        control_period = 1.0 / float(self.get_parameter('control_rate').value)
+        self.control_timer = self.create_timer(control_period, self.control_loop)
+
+        watchdog_period = 1.0 / float(self.get_parameter('watchdog_rate').value)
         self.watchdog_timer = self.create_timer(watchdog_period, self.watchdog_callback)
 
-        # Control loop (50 Hz)
-        self.control_timer = self.create_timer(self.DT, self.control_loop)
+        self.get_logger().info(
+            "PS5 Mapper Node initialized: Pure FK Velocity Mode -> /arm_cmd (Int16MultiArray [J0..J4, Gripper] ∈ [-255, 255])."
+        )
 
-        # RTH action client (connects to rth_node's /return_to_home action server)
-        self._rth_action_client = ActionClient(self, ReturnToHome, 'return_to_home')
-
-        self.get_logger().info("PS5 Mapper Node started (Dual Mode: FK & IK Cartesian Control).")
-
-    def apply_deadzone(self, value: float, threshold: float = None) -> float:
-        """Applies a standard deadzone filter to an axis value."""
-        if threshold is None:
-            threshold = self.deadzone
-        return value if abs(value) > threshold else 0.0
-
-    def get_trigger_value(self, raw_axis_val: float) -> float:
-        """
-        Normalizes PS5 analog trigger axis from [-1.0, 1.0] (1.0=unpressed, -1.0=fully pressed)
-        to [0.0, 1.0] (0.0=unpressed, 1.0=fully pressed).
-        """
-        normalized = (1.0 - raw_axis_val) / 2.0
-        if normalized <= self.deadzone:
+    def normalize_axis(self, value: float) -> float:
+        """Applies deadzone filter and normalizes deflection linearly to [-1.0, 1.0]."""
+        abs_val = abs(value)
+        if abs_val <= self.deadzone:
             return 0.0
-        return min(1.0, normalized)
+        ratio = (abs_val - self.deadzone) / (1.0 - self.deadzone)
+        ratio = min(1.0, max(0.0, ratio))
+        return ratio if value > 0.0 else -ratio
 
-    def _clamp_to_workspace_sphere(self):
-        """
-        Enforces that (target_r, target_z) lies inside the spherical kinematic envelope:
-            r² + (z - SHOULDER_PIVOT_Z)² ≤ WORKSPACE_RADIUS²
-        Also applies the hard floor/ceiling on z and minimum-r floor (base column deadzone).
-
-        This replaces independent rectangle clamping on r and z, preventing
-        the IK solver from being commanded into corners that are kinematically
-        unreachable (which causes silent stick freezes / position hold).
-        """
-        # 1. Hard floor/ceiling on z (absolute physical extremes)
-        self.target_z = max(self.ELEV_LIMITS[0], min(self.ELEV_LIMITS[1], self.target_z))
-
-        # 2. Spherical ceiling on r given current z
-        z_rel = self.target_z - self.SHOULDER_PIVOT_Z
-        r_max_at_z = math.sqrt(max(0.0, self.WORKSPACE_RADIUS**2 - z_rel**2))
-        r_max_at_z = min(r_max_at_z, self.REACH_LIMITS[1])  # also honour absolute r ceiling
-
-        # 3. Clamp r into [r_min, r_max_at_z]
-        self.target_r = max(self.REACH_LIMITS[0], min(r_max_at_z, self.target_r))
-
-    def _apply_speed_delta(self, axis_name: str, delta: float, min_s: float, max_s: float):
-        """Increments or decrements joint / Cartesian max speed within safe bounds and logs update."""
-        if axis_name in ("Base Yaw", "Azimuth"):
-            if self.MODE == 0:
-                self.max_base_speed = max(min_s, min(max_s, round(self.max_base_speed + delta, 3)))
-                val, unit = self.max_base_speed, "rad/s"
-            else:
-                self.max_azimuth_speed = max(min_s, min(max_s, round(self.max_azimuth_speed + delta, 3)))
-                val, unit = self.max_azimuth_speed, "rad/s"
-        elif axis_name in ("Shoulder Pitch", "Reach"):
-            if self.MODE == 0:
-                self.max_shoulder_speed = max(min_s, min(max_s, round(self.max_shoulder_speed + delta, 3)))
-                val, unit = self.max_shoulder_speed, "rad/s"
-            else:
-                self.max_reach_speed = max(0.01, min(0.50, round(self.max_reach_speed + (delta * 0.5), 3)))
-                val, unit = self.max_reach_speed, "m/s"
-        elif axis_name in ("Elbow Pitch", "Elevation"):
-            if self.MODE == 0:
-                self.max_elbow_speed = max(min_s, min(max_s, round(self.max_elbow_speed + delta, 3)))
-                val, unit = self.max_elbow_speed, "rad/s"
-            else:
-                self.max_elev_speed = max(0.01, min(0.50, round(self.max_elev_speed + (delta * 0.5), 3)))
-                val, unit = self.max_elev_speed, "m/s"
-        elif axis_name in ("Wrist", "Pitch & Roll"):
-            if self.MODE == 0:
-                self.max_wrist_speed = max(min_s, min(max_s, round(self.max_wrist_speed + delta, 3)))
-                val, unit = self.max_wrist_speed, "rad/s"
-            else:
-                self.max_world_pitch_speed = max(min_s, min(max_s, round(self.max_world_pitch_speed + delta, 3)))
-                self.max_roll_speed = max(min_s, min(max_s, round(self.max_roll_speed + delta, 3)))
-                val, unit = self.max_world_pitch_speed, "rad/s"
-        elif axis_name == "Gripper":
-            self.max_gripper_speed = max(min_s, min(max_s, round(self.max_gripper_speed + delta, 3)))
-            val, unit = self.max_gripper_speed, "rad/s"
-        else:
-            return
-
-        self.get_logger().info(f"[SPEED TRIM] {axis_name} max speed: {val:.2f} {unit}")
-
-    def check_estop_btn(self, new_state: int):
-        """
-        Detects rising edge on the PS button to toggle the software Emergency Stop / Motion Lock.
-        When active, position increments in control_loop are frozen, holding current arm and gripper position.
-        Also cancels any active RTH goal immediately.
-        """
-        if new_state == 1 and self.prev_estop_btn_state == 0:
+    def check_estop(self, estop_btn_state: int):
+        """Toggles Emergency Stop on rising edge of the PS Button."""
+        if estop_btn_state == 1 and self.prev_estop_btn_state == 0:
             self.e_stop_active = not self.e_stop_active
             if self.e_stop_active:
-                self.get_logger().error("EMERGENCY STOP ENGAGED! Arm target position locked.")
-                # If RTH is active, cancel it immediately
-                if self.rth_active:
-                    self.get_logger().warn("E-Stop during RTH: canceling RTH goal.")
-                    self._cancel_rth_goal(reason="estop")
+                self.get_logger().error("EMERGENCY STOP ENGAGED! All arm motor velocities clamped to 0.")
+                self.trigger_rumble(0.1, 0.1)
             else:
                 self.get_logger().info("EMERGENCY STOP CLEARED. Normal operation resumed.")
-        self.prev_estop_btn_state = new_state
+                self.trigger_rumble(0.1, 0.1)
 
-    def joint_sync_callback(self, msg: Float32MultiArray):
-        """
-        Callback for /arm_joint_sync topic published by ik_solver_node.
-        Continuously mirrors the latest solved joint angles into self.target_positions
-        while operating in IK mode (MODE == 1) to enable bumpless IK -> FK transitions.
-        """
-        if self.MODE == 1 and len(msg.data) >= 5:
-            for i in range(5):
-                self.target_positions[i] = msg.data[i]
+                self.trigger_rumble(0.1, 0.1)
+        self.prev_estop_btn_state = estop_btn_state
 
-    def check_mode_btn(self, new_state: int):
-        """
-        Detects rising edge on the OPTIONS button to toggle between Mode 0 (FK) and Mode 1 (IK).
-        Executes bumpless handoffs:
-          - FK -> IK: Computes 3D Forward Kinematics from current self.target_positions to initialize
-                      Cartesian targets (r, theta, z, world_pitch, roll) at the exact physical gripper pose.
-          - IK -> FK: Resumes joint publishing from self.target_positions (already synchronized via /arm_joint_sync).
-        """
-        if new_state == 1 and self.prev_mode_btn_state == 0:
-            self.MODE = 1 - self.MODE
-            if self.MODE == 1:
-                # Bumpless FK -> IK transition: compute Cartesian wrist targets from current joint angles
-                r, theta, z, world_pitch, roll = self.compute_wrist_fk(self.target_positions)
-                self.target_r = r
-                self.target_z = z
-                self._clamp_to_workspace_sphere()
-                self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], theta))
-                self.target_world_pitch = max(self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], world_pitch))
-                self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], roll))
-                self.get_logger().info(
-                    f"Switched to IK Mode (Bumpless FK->IK sync: r={self.target_r:.3f}m, "
-                    f"theta={self.target_theta:.3f}rad, z={self.target_z:.3f}m, pitch={self.target_world_pitch:.3f}rad)."
-                )
-            else:
-                # Bumpless IK -> FK transition: self.target_positions was continuously mirrored via /arm_joint_sync
-                self.get_logger().info(
-                    f"Switched to FK Mode (Bumpless IK->FK sync: resumed joints "
-                    f"{[round(x, 3) for x in self.target_positions[:5]]})."
-                )
-        self.prev_mode_btn_state = new_state
+    def trigger_rumble(self, low_freq: float, high_freq: float):
+        """Sends momentary haptic feedback to PS5 controller."""
+        msg_left = JoyFeedback()
+        msg_left.type = JoyFeedback.TYPE_RUMBLE
+        msg_left.id = 0
+        msg_left.intensity = float(low_freq)
+        self.feedback_pub.publish(msg_left)
 
-    def check_rth_btn(self, new_state: int):
-        """
-        Detects rising edge on SHARE (button 8) to toggle Return-to-Home mode.
-          - First press:  engages RTH, locks joystick, sends Action Goal to rth_node.
-          - Second press: cancels RTH Goal, halts arm in place, resumes prior mode bumplessly.
-        """
-        if new_state == 1 and self.prev_rth_btn_state == 0:
-            if not self.rth_active:
-                self._engage_rth()
-            else:
-                self._cancel_rth_goal()
-        self.prev_rth_btn_state = new_state
-
-    def _engage_rth(self):
-        """Locks joystick inputs and sends a ReturnToHome goal to rth_node."""
-        if not self._rth_action_client.wait_for_server(timeout_sec=1.0):
-            self.get_logger().error(
-                "[RTH] Action server '/return_to_home' not available! "
-                "Is rth_node running? RTH aborted.")
-            return
-
-        self.rth_active = True
-        self.pre_rth_mode = self.MODE
-        self.get_logger().info(
-            f"[RTH] ENGAGED. Locking joystick (pre-RTH mode: {'FK' if self.MODE == 0 else 'IK'}). "
-            "Press SHARE again to cancel.")
-
-        goal = ReturnToHome.Goal()
-        goal.speed_scaling = 1.0
-        goal.start_joints = [float(x) for x in self.target_positions[:5]]
-        goal.gripper_position = float(self.target_positions[5])
-
-        send_future = self._rth_action_client.send_goal_async(
-            goal,
-            feedback_callback=self._rth_feedback_callback)
-        send_future.add_done_callback(self._rth_goal_response_callback)
-
-    def _rth_goal_response_callback(self, future):
-        """Called once the action server has accepted or rejected the goal."""
-        goal_handle = future.result()
-        if not goal_handle.accepted:
-            self.get_logger().error("[RTH] Goal rejected by rth_node. Resuming normal control.")
-            self.rth_active = False
-            return
-
-        self._rth_goal_handle = goal_handle
-        self.get_logger().info("[RTH] Goal accepted. Arm returning to home position...")
-
-        # Register result callback to handle completion or cancellation
-        result_future = goal_handle.get_result_async()
-        result_future.add_done_callback(self._rth_result_callback)
-
-    def _rth_result_callback(self, future):
-        """Called when the RTH action completes (succeeded, canceled, or aborted)."""
-        result_wrapper = future.result()
-        result = result_wrapper.result
-        status = result_wrapper.status
-
-        import action_msgs.msg as action_msgs_module
-        if status == action_msgs_module.GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info(f"[RTH] Complete: {result.message}")
-            for i in range(5):
-                self.target_positions[i] = self.HOME_POSITIONS[i]
-        else:
-            self.get_logger().info(f"[RTH] Ended: {result.message}")
-
-        self._rth_bumpless_resume()
-
-    def _rth_feedback_callback(self, feedback_msg):
-        """
-        Receives live joint positions from rth_node and mirrors them into target_positions
-        so that bumpless resume always starts from the arm's actual stopped location.
-        """
-        joints = list(feedback_msg.feedback.current_joints)
-        for i in range(5):
-            self.target_positions[i] = joints[i]
-
-    def _cancel_rth_goal(self, reason: str = "operator"):
-        """Sends a cancellation request to rth_node. Result callback handles bumpless resume."""
-        if reason == "comms_loss":
-            self.get_logger().error(
-                "[RTH SAFETY LOCKDOWN] Joystick signal lost during active RTH! Preempting homing trajectory."
-            )
-        elif reason == "estop":
-            self.get_logger().warn("[RTH] Cancellation requested due to Emergency Stop.")
-        else:
-            self.get_logger().info("[RTH] Cancellation requested by operator.")
-
-        if self._rth_goal_handle is not None:
-            cancel_future = self._rth_goal_handle.cancel_goal_async()
-            cancel_future.add_done_callback(
-                lambda _: self.get_logger().info(f"[RTH] Cancel request sent to rth_node (reason: {reason})."))
-        else:
-            # No active goal handle — just reset state immediately
-            self._rth_bumpless_resume()
-
-    def _rth_bumpless_resume(self):
-        """
-        Restores normal teleoperation after RTH ends (success, cancel, or abort).
-        Re-seeds FK/IK state from target_positions (which was kept live via feedback callback).
-        Resumes the mode that was active before RTH.
-        """
-        # Restore pre-RTH mode
-        self.MODE = self.pre_rth_mode
-
-        # Warm-seed ik_solver_node via /arm_fk_sync with the resumed posture
-        sync_msg = Float32MultiArray()
-        sync_msg.data = list(self.target_positions)
-        self.fk_sync_pub.publish(sync_msg)
-
-        if self.MODE == 1:
-            # Re-initialize IK Cartesian targets from the arm's current joint state
-            r, theta, z, world_pitch, roll = self.compute_wrist_fk(self.target_positions)
-            self.target_r = r
-            self.target_z = z
-            self._clamp_to_workspace_sphere()
-            self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], theta))
-            self.target_world_pitch = max(
-                self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], world_pitch))
-            self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], roll))
-
-        self.rth_active = False
-        self._rth_goal_handle = None
-        mode_str = 'FK' if self.MODE == 0 else 'IK'
-        self.get_logger().info(
-            f"[RTH] Normal control resumed in {mode_str} Mode. Bumpless sync complete.")
+        msg_right = JoyFeedback()
+        msg_right.type = JoyFeedback.TYPE_RUMBLE
+        msg_right.id = 1
+        msg_right.intensity = float(high_freq)
+        self.feedback_pub.publish(msg_right)
 
     def joy_callback(self, msg: Joy):
-        """Records controller input state. Does NOT publish arm commands (handled by control_loop)."""
-        # Validate minimum expected axes and buttons
-        if len(msg.axes) <= max(self.DPAD_X, self.DPAD_Y, self.RT, self.RJOY_Y) or len(msg.buttons) <= max(self.PS_BTN, self.OPTIONS, self.RB, self.SHARE):
-            return
-
-        # Update watchdog heartbeat
+        """Processes incoming controller stick and button inputs."""
         self.last_joy_time = self.get_clock().now()
-        self.signal_lost = False
+        if self.signal_lost:
+            self.signal_lost = False
+            self.get_logger().info("Joystick signal restored. Normal teleop resumed.")
 
-        # 1. Emergency Stop / Motion Lock Latch (PS Button) — always active, even during RTH
-        self.check_estop_btn(msg.buttons[self.PS_BTN])
+        # 1. Emergency Stop Check (PS Button)
+        if len(msg.buttons) > self.PS_BTN:
+            self.check_estop(msg.buttons[self.PS_BTN])
 
-        # 2. Return-to-Home Toggle (SHARE button) — always active
-        self.check_rth_btn(msg.buttons[self.SHARE])
-
-        # ── While in RTH mode, suppress ALL other joystick inputs ──
-        if self.rth_active:
-            return
-
-        # 3. Mode toggling via OPTIONS button (rising edge detection)
-        self.check_mode_btn(msg.buttons[self.OPTIONS])
-
-        # 3. Record D-Pad X axis for gripper open/close and detect pushes into limits
-        dpad_x = msg.axes[self.DPAD_X]
-        min_lim, max_lim = self.JOINT_LIMITS[5]
-        if dpad_x > 0.5 and self.prev_dpad_x <= 0.5:
-            # Operator commanded Open, but already at or above max limit
-            if self.gripper_feedback_angle >= max_lim - 0.01:
-                self.trigger_limit_rumble()
-        elif dpad_x < -0.5 and self.prev_dpad_x >= -0.5:
-            # Operator commanded Close, but already at or below min limit
-            if self.gripper_feedback_angle <= min_lim + 0.01:
-                self.trigger_limit_rumble()
-        self.prev_dpad_x = dpad_x
-        self.dpad_x = dpad_x
-
-        # 4. Speed Trimming (Shape Buttons + Triggers)
-        cross_held = bool(msg.buttons[self.CROSS])
-        square_held = bool(msg.buttons[self.SQUARE])
-        circle_held = bool(msg.buttons[self.CIRCLE])
-        triangle_held = bool(msg.buttons[self.TRIANGLE])
-
-        self.is_tuning_speed = cross_held or square_held or circle_held or triangle_held
-
-        if self.is_tuning_speed:
-            step = self.speed_step
-            min_s = self.trim_min_bound
-            max_s = self.trim_max_bound
-            now_sec = self.get_clock().now().nanoseconds / 1e9
-
-            if self.MODE == 0:
-                if cross_held:
-                    selected_axis = "Base Yaw"
-                elif square_held:
-                    selected_axis = "Shoulder Pitch"
-                elif circle_held:
-                    selected_axis = "Elbow Pitch"
-                else:
-                    selected_axis = "Wrist"
-            else:
-                if cross_held:
-                    selected_axis = "Azimuth"
-                elif square_held:
-                    selected_axis = "Reach"
-                elif circle_held:
-                    selected_axis = "Elevation"
-                else:
-                    selected_axis = "Pitch & Roll"
-
-            lt_val = self.get_trigger_value(msg.axes[self.LT])
-            rt_val = self.get_trigger_value(msg.axes[self.RT])
-            rt_active = (rt_val > 0.5)
-            lt_active = (lt_val > 0.5)
-
-            delta = 0.0
-            if rt_active and not lt_active:
-                delta = step
-            elif lt_active and not rt_active:
-                delta = -step
-
-            if delta != 0.0:
-                is_new_press = (rt_active and not self.prev_rt_active) or (lt_active and not self.prev_lt_active)
-                if is_new_press:
-                    self.trim_held_start_time = now_sec
-                    self.last_trim_time = now_sec
-                    self._apply_speed_delta(selected_axis, delta, min_s, max_s)
-                else:
-                    if (now_sec - self.trim_held_start_time) > 0.4 and (now_sec - self.last_trim_time) > 0.15:
-                        self.last_trim_time = now_sec
-                        self._apply_speed_delta(selected_axis, delta, min_s, max_s)
-
-            self.prev_rt_active = rt_active
-            self.prev_lt_active = lt_active
-
-            # Safety Lockout: Zero stick inputs and reset axis lock filter during speed tuning
+        # If E-Stop is active, immediately zero stored stick values
+        if self.e_stop_active:
             self.lx = 0.0
             self.ly = 0.0
             self.rx = 0.0
             self.ry = 0.0
-            self.left_stick_lock.locked_axis = None
-            self.lb_held = bool(msg.buttons[self.LB])
-            self.rb_held = bool(msg.buttons[self.RB])
+            self.lb_held = False
+            self.rb_held = False
+            self.gripper_cmd = 0
             return
 
-        # Reset trigger edge state when shape buttons are released
-        self.prev_rt_active = False
-        self.prev_lt_active = False
+        # 2. Record Bumper Modifiers
+        if len(msg.buttons) > self.LB:
+            self.lb_held = bool(msg.buttons[self.LB])
+        if len(msg.buttons) > self.RB:
+            self.rb_held = bool(msg.buttons[self.RB])
 
-        # 6. Record stick axes and bumper states
-        deadzone = self.deadzone
-        self.lb_held = bool(msg.buttons[self.LB])
-        self.rb_held = bool(msg.buttons[self.RB])
+        # 3. Filter Left Stick (J0: Base Yaw, J1: Shoulder Pitch)
+        raw_lx = msg.axes[self.LJOY_X] if len(msg.axes) > self.LJOY_X else 0.0
+        raw_ly = msg.axes[self.LJOY_Y] if len(msg.axes) > self.LJOY_Y else 0.0
 
         if self.axis_lock_enabled:
-            self.lx, self.ly = self.left_stick_lock.filter(msg.axes[self.LJOY_X], msg.axes[self.LJOY_Y], deadzone)
+            flt_lx, flt_ly = self.left_stick_lock.filter(raw_lx, raw_ly, self.deadzone)
         else:
-            self.lx = self.apply_deadzone(msg.axes[self.LJOY_X], deadzone)
-            self.ly = self.apply_deadzone(msg.axes[self.LJOY_Y], deadzone)
+            flt_lx, flt_ly = raw_lx, raw_ly
 
-        self.rx = self.apply_deadzone(msg.axes[self.RJOY_X], deadzone)
-        self.ry = self.apply_deadzone(msg.axes[self.RJOY_Y], deadzone)
+        self.lx = self.normalize_axis(flt_lx)
+        self.ly = self.normalize_axis(flt_ly)
+
+        # 4. Filter Right Stick (J2: Elbow, or J3: Wrist Pitch & J4: Wrist Roll)
+        raw_rx = msg.axes[self.RJOY_X] if len(msg.axes) > self.RJOY_X else 0.0
+        raw_ry = msg.axes[self.RJOY_Y] if len(msg.axes) > self.RJOY_Y else 0.0
+
+        self.rx = self.normalize_axis(raw_rx)
+        self.ry = self.normalize_axis(raw_ry)
+
+        # 5. Gripper on D-Pad Left/Right (Left = Open [+128], Right = Close [-128])
+        raw_dpad_x = msg.axes[self.DPAD_X] if len(msg.axes) > self.DPAD_X else 0.0
+        speed = int(self.get_parameter('gripper_speed').value)
+        if raw_dpad_x > 0.5:
+            self.gripper_cmd = speed    # D-Pad Left: Open
+        elif raw_dpad_x < -0.5:
+            self.gripper_cmd = -speed   # D-Pad Right: Close
+        else:
+            self.gripper_cmd = 0
+
+    def compute_joint_pwm(self, norm_val: float, max_speed_param: str, invert_param: str) -> int:
+        """Converts normalized deflection [-1.0, 1.0] to integer PWM speed [-255, 255]."""
+        if abs(norm_val) < 1e-4:
+            return 0
+
+        max_speed = int(self.get_parameter(max_speed_param).value)
+        max_speed = max(0, min(255, max_speed))
+
+        speed_scale = self.precision_scale if self.lb_held else 1.0
+        pwm = int(round(norm_val * max_speed * speed_scale))
+        pwm = max(-max_speed, min(max_speed, pwm))
+
+        if bool(self.get_parameter(invert_param).value):
+            pwm = -pwm
+
+        return int(max(-255, min(255, pwm)))
 
     def control_loop(self):
         """
-        Main 50 Hz deterministic integration and publishing loop.
-
-        Behavior:
-          - Evaluates safety interlocks (E-Stop latch, watchdog signal loss timeout).
-          - In Mode 0 (FK):
-              * Integrates stick inputs into individual joint angles (self.target_positions).
-              * Clamps angles to JOINT_LIMITS to prevent command windup.
-              * Publishes 6-element Float32MultiArray [J0..J4, gripper] directly to /arm_cmd.
-          - In Mode 1 (IK):
-              * Integrates stick inputs into cylindrical coordinates (r, theta, z, world_pitch, roll).
-              * Clamps Cartesian state to spherical workspace envelope (WORKSPACE_RADIUS, SHOULDER_PIVOT_Z)
-                plus azimuth, world_pitch, and roll hard limits.
-              * Publishes PoseStamped to /arm_target_pose for live RViz visualization.
-              * Publishes 6-element Float32MultiArray [r, theta, z, pitch, roll, gripper] to /arm_ik_cmd
-                (commanding ik_solver_node, which solves TRAC-IK and outputs to /arm_cmd).
-          - Gripper integration runs across both modes (D-Pad Left = Open, D-Pad Right = Close).
+        Deterministic 50 Hz control loop. Computes and streams 6-element /arm_cmd array.
         """
-        dt = self.DT
-        speed_mult = self.precision_scale if self.lb_held else 1.0
+        if self.e_stop_active or self.signal_lost:
+            self.cmd_output = [0, 0, 0, 0, 0, 0]
+        else:
+            # J0: Base Yaw (Left Stick X)
+            j0_pwm = self.compute_joint_pwm(self.lx, 'max_j0_speed', 'invert_j0')
 
-        # Freeze position increments if E-Stop or signal lost
-        if not (self.e_stop_active or self.signal_lost):
+            # J1: Shoulder Pitch (Left Stick Y)
+            j1_pwm = self.compute_joint_pwm(self.ly, 'max_j1_speed', 'invert_j1')
 
-            # Freeze arm increments during speed tuning, but allow gripper
-            if not self.is_tuning_speed:
-                if self.MODE == 0:
-                    # --- FK Mode: Joint Position Integration ---
-                    self.target_positions[0] += self.lx * self.max_base_speed * speed_mult * dt      # Base Yaw
-                    self.target_positions[1] += self.ly * self.max_shoulder_speed * speed_mult * dt  # Shoulder Pitch
-
-                    if not self.rb_held:
-                        # Default Reach Mode: Right Stick Y controls Elbow
-                        self.target_positions[2] += self.ry * self.max_elbow_speed * speed_mult * dt     # Elbow Pitch
-                    else:
-                        # Wrist Gimbal Mode (RB held): Right Stick controls Wrist Pitch (Y) & Roll (X)
-                        self.target_positions[3] += self.ry * self.max_wrist_speed * speed_mult * dt     # Wrist Pitch
-                        self.target_positions[4] += self.rx * self.max_wrist_speed * speed_mult * dt     # Wrist Roll
-
-                elif self.MODE == 1:
-                    # --- IK Mode: Cylindrical Coordinates Integration ---
-                    # Left Stick: Base Azimuth (X) and Radial Reach (Y)
-                    self.target_theta += self.lx * self.max_azimuth_speed * speed_mult * dt
-                    self.target_r += self.ly * self.max_reach_speed * speed_mult * dt
-
-                    if not self.rb_held:
-                        # Translation Mode: Right Stick Y controls Vertical Elevation (Z)
-                        self.target_z += self.ry * self.max_elev_speed * speed_mult * dt
-                    else:
-                        # Orientation Layer (RB held): Right Stick controls World Pitch (Y) & Axial Roll (X)
-                        self.target_world_pitch += self.ry * self.max_world_pitch_speed * speed_mult * dt
-                        self.target_roll += self.rx * self.max_roll_speed * speed_mult * dt
-
-                    # Dynamic Leash Anti-Windup against actual solved wrist position (in r, theta, z)
-                    r_act, theta_act, z_act, _, _ = self.compute_wrist_fk(self.target_positions)
-                    dr = self.target_r - r_act
-                    dz = self.target_z - z_act
-                    dtheta = self.target_theta - theta_act
-                    while dtheta > math.pi:
-                        dtheta -= 2.0 * math.pi
-                    while dtheta < -math.pi:
-                        dtheta += 2.0 * math.pi
-
-                    # Tangential lead along the arc: r * dtheta
-                    d_tangential = max(0.10, r_act) * dtheta
-                    dist_3d = math.hypot(dr, d_tangential, dz)
-                    if dist_3d > self.LEASH_MAX_M:
-                        scale = self.LEASH_MAX_M / dist_3d
-                        self.target_r = r_act + dr * scale
-                        self.target_z = z_act + dz * scale
-                        self.target_theta = theta_act + dtheta * scale
-
-                    # Clamp Cartesian targets to spherical workspace envelope
-                    self._clamp_to_workspace_sphere()
-                    self.target_theta = max(self.AZIMUTH_LIMITS[0], min(self.AZIMUTH_LIMITS[1], self.target_theta))
-                    self.target_world_pitch = max(
-                        self.WORLD_PITCH_LIMITS[0], min(self.WORLD_PITCH_LIMITS[1], self.target_world_pitch)
-                    )
-                    self.target_roll = max(self.ROLL_LIMITS[0], min(self.ROLL_LIMITS[1], self.target_roll))
-
-            # Gated momentary gripper control:
-            # D-Pad Left = +1.0 (Open) only if physical angle < max_limit
-            # D-Pad Right = -1.0 (Close) only if physical angle > min_limit
-            # Neutral = 0.0
-            min_angle, max_angle = self.JOINT_LIMITS[5]
-            if self.dpad_x > 0.5 and self.gripper_feedback_angle < max_angle:
-                self.target_positions[5] = 1.0     # Open
-            elif self.dpad_x < -0.5 and self.gripper_feedback_angle > min_angle:
-                self.target_positions[5] = -1.0    # Close
+            if not self.rb_held:
+                # Default Reach Layer: Right Stick Y controls J2 (Elbow Pitch)
+                j2_pwm = self.compute_joint_pwm(self.ry, 'max_j2_speed', 'invert_j2')
+                j3_pwm = 0
+                j4_pwm = 0
             else:
-                self.target_positions[5] = 0.0     # Revert to neutral
+                # Wrist Gimbal Layer (RB held): Right Stick controls J3 Pitch (Y) & J4 Roll (X)
+                j2_pwm = 0
+                j3_pwm = self.compute_joint_pwm(self.ry, 'max_j3_speed', 'invert_j3')
+                j4_pwm = self.compute_joint_pwm(self.rx, 'max_j4_speed', 'invert_j4')
 
-        # Clamp arm joints (0..4) to limits to prevent command windup
-        for i in range(5):
-            lo, hi = self.JOINT_LIMITS[i]
-            self.target_positions[i] = max(lo, min(hi, self.target_positions[i]))
+            # J5: Gripper Jaw (D-Pad Left/Right -> -128 / +128)
+            gripper_pwm = self.gripper_cmd
+            if bool(self.get_parameter('invert_gripper').value):
+                gripper_pwm = -gripper_pwm
 
-        # Mode-Gated Publishing:
-        # Suppressed entirely while rth_active — rth_node owns /arm_cmd during RTH.
-        # FK Mode: ps5_mapper directly publishes [J0..J4, Gripper] to /arm_cmd and /arm_fk_sync
-        # IK Mode: ps5_mapper publishes [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
-        #          and PoseStamped to /arm_target_pose; ik_solver_node solves TRAC-IK and outputs to /arm_cmd
-        if not self.rth_active:
-            if self.MODE == 0:
-                cmd_msg = Float32MultiArray()
-                cmd_msg.data = list(self.target_positions)
-                self.publisher.publish(cmd_msg)
-                self.fk_sync_pub.publish(cmd_msg)
-            elif self.MODE == 1:
-                # Compute Cartesian Coordinates (wrist_center relative to base_link)
-                pose_msg = PoseStamped()
-                pose_msg.header.stamp = self.get_clock().now().to_msg()
-                pose_msg.header.frame_id = 'base_link'
-                pose_msg.pose.position.x = (
-                    self.BASE_PIVOT_X
-                    + self.target_r * math.sin(self.target_theta)
-                    + self.ARM_LATERAL_OFFSET * math.cos(self.target_theta)
-                )
-                pose_msg.pose.position.y = (
-                    self.BASE_PIVOT_Y
-                    - self.target_r * math.cos(self.target_theta)
-                    + self.ARM_LATERAL_OFFSET * math.sin(self.target_theta)
-                )
-                pose_msg.pose.position.z = self.target_z
+            self.cmd_output = [j0_pwm, j1_pwm, j2_pwm, j3_pwm, j4_pwm, gripper_pwm]
 
-                # Compute Auto-Leveling Orientation Quaternion matching physical tool0 frame:
-                # R_tool0 = R_z(theta) @ R_x(-world_pitch) @ R_y(roll) @ R_z(pi)
-                r_mat = (
-                    R.from_euler('z', self.target_theta).as_matrix()
-                    @ R.from_euler('x', -self.target_world_pitch).as_matrix()
-                    @ R.from_euler('y', self.target_roll).as_matrix()
-                    @ R.from_euler('z', np.pi).as_matrix()
-                )
-                qx, qy, qz, qw = R.from_matrix(r_mat).as_quat()
-                pose_msg.pose.orientation.x = float(qx)
-                pose_msg.pose.orientation.y = float(qy)
-                pose_msg.pose.orientation.z = float(qz)
-                pose_msg.pose.orientation.w = float(qw)
-
-                # Publish Cartesian Pose for visualization (RViz / MoveIt)
-                self.target_pose_pub.publish(pose_msg)
-
-                # Publish unified IK command array [r, theta, z, world_pitch, roll, gripper] to /arm_ik_cmd
-                ik_msg = Float32MultiArray()
-                ik_msg.data = [
-                    float(self.target_r),
-                    float(self.target_theta),
-                    float(self.target_z),
-                    float(self.target_world_pitch),
-                    float(self.target_roll),
-                    float(self.target_positions[5])
-                ]
-                self.ik_target_pub.publish(ik_msg)
-
-        # Update and publish blended haptic feedback (limit rumble pulse & grip load)
-        self._publish_rumble_feedback()
+        # Publish 6-element Int16MultiArray on /arm_cmd
+        msg = Int16MultiArray()
+        msg.data = list(self.cmd_output)
+        self.cmd_pub.publish(msg)
 
     def watchdog_callback(self):
-        """Monitors joystick heartbeat; sets signal_lost flag if communication drops."""
+        """Monitors joystick heartbeat. Forces all outputs to 0 on timeout."""
         if self.last_joy_time is None:
             return
 
         elapsed_sec = (self.get_clock().now() - self.last_joy_time).nanoseconds / 1e9
-        timeout = self.watchdog_timeout
-
-        if elapsed_sec > timeout and not self.signal_lost:
+        if elapsed_sec > self.watchdog_timeout and not self.signal_lost:
             self.signal_lost = True
+            self.cmd_output = [0, 0, 0, 0, 0, 0]
+            msg = Int16MultiArray()
+            msg.data = [0, 0, 0, 0, 0, 0]
+            self.cmd_pub.publish(msg)
             self.get_logger().warn(
-                f"Joy input timed out ({elapsed_sec:.2f}s > {timeout}s). Position held."
+                f"Joy input timed out ({elapsed_sec:.2f}s > {self.watchdog_timeout}s). All motors stopped."
             )
 
-            # --- RTH Safety Lockdown Interlock ---
-            # Immediately abort RTH trajectory and freeze joints if controller comms drop
-            if self.rth_active:
-                # TODO: Implement a smooth S-curve deceleration stop over 1.0–2.0 seconds
-                #       instead of an immediate setpoint freeze.
-                #       Architecture roadmap:
-                #         1. In rth_node.cpp, when cancel is requested with reason='comms_loss',
-                #            sample current joint velocities (dq_i = delta_i * d/ds(smooth_s) * 1/T).
-                #         2. Plan a cubic or quintic polynomial braking ramp over T_stop = 1.0–2.0s
-                #            ensuring d^2q/dt^2 does not exceed joint_limits.yaml max_acceleration.
-                #         3. Stream braking waypoints to /arm_cmd until dq -> 0, then complete cancel.
-                self._cancel_rth_goal(reason="comms_loss")
-
-    def trigger_limit_rumble(self):
-        """Triggers a 200 ms momentary tactile rumble at 80% intensity for limit contact."""
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        self.limit_rumble_until = now_sec + 0.20
-        self._publish_rumble_feedback()
-
-    def _publish_rumble_feedback(self):
-        """Calculates blended rumble intensity and publishes to /joy/set_feedback."""
-        now_sec = self.get_clock().now().nanoseconds / 1e9
-        limit_intensity = 0.80 if now_sec < self.limit_rumble_until else 0.0
-
-        if self.gripper_feedback_load > 150.0:
-            load_intensity = min(1.0, (self.gripper_feedback_load - 150.0) / 850.0)
-        else:
-            load_intensity = 0.0
-
-        total_intensity = max(limit_intensity, load_intensity)
-
-        for rumble_id in (0, 1):
-            fb = JoyFeedback()
-            fb.type = JoyFeedback.TYPE_RUMBLE
-            fb.id = rumble_id
-            fb.intensity = total_intensity
-            self.feedback_publisher.publish(fb)
-
-    def grip_feedback_callback(self, msg: Float32MultiArray):
-        # 787 = 90, 1817 = 0 angle mapping.
-        # load exceed 50 then freeze internal angle and move into gripping object state.
-        # when gripping, if close is commanded nothing happens. load values from servo just update.
-        # when gripping and open is commanded, the gripper will open and exit gripping state, and read the new angle comign in.
-        """Receives gripper feedback and publishes haptic rumble commands to DualSense.
-
-        Payload:
-          msg.data[0]: angle of the gripper (float, radians)
-          msg.data[1]: load the gripper is experiencing (float, 0 to 1000)
-        """
-        if len(msg.data) < 2:
-            return
-
-        self.gripper_feedback_angle = float(msg.data[0])
-        self.gripper_feedback_load = float(msg.data[1])
-
-        # Detect edge arrival at physical limits (0.00 rad closed, 1.57 rad open)
-        min_lim, max_lim = self.JOINT_LIMITS[5]
-        limit_triggered = False
-        if self.gripper_feedback_angle <= min_lim + 0.01:
-            if not self.was_at_min_limit:
-                self.trigger_limit_rumble()
-                self.was_at_min_limit = True
-                limit_triggered = True
-        elif self.gripper_feedback_angle > min_lim + 0.03:
-            self.was_at_min_limit = False
-
-        if self.gripper_feedback_angle >= max_lim - 0.01:
-            if not self.was_at_max_limit:
-                self.trigger_limit_rumble()
-                self.was_at_max_limit = True
-                limit_triggered = True
-        elif self.gripper_feedback_angle < max_lim - 0.03:
-            self.was_at_max_limit = False
-
-        if not limit_triggered:
-            self._publish_rumble_feedback()
-
-    def compute_wrist_fk(self, joints: list[float]) -> tuple[float, float, float, float, float]:
-        """
-        Computes 3D Forward Kinematics for wrist_center (end of Link 2 / wrist pitch axis)
-        relative to base_link from joint angles.
-        Derived from link origin vectors and rotations in arm_cad.urdf.xacro.
-
-        Args:
-            joints: List of joint angles in radians [base_yaw, shoulder, elbow, wrist_pitch, wrist_roll, ...].
-
-        Returns:
-            tuple (r, theta, z, world_pitch, roll):
-              - r (float): Forward sagittal reach from shoulder to wrist_center (meters).
-              - theta (float): Base azimuth angle relative to forward (radians, 0 = forward).
-              - z (float): Vertical elevation of wrist_center relative to base_link origin (meters).
-              - world_pitch (float): Gripper pitch angle relative to the ground horizon (radians).
-              - roll (float): Wrist axial roll angle (radians).
-        """
-        q = joints
-
-        # Transform in the arm rotating frame (q0 = 0)
-        T_arm = _t_mat(trans=(0.0145, 0.0, 0.070))
-        T_arm = T_arm @ _t_mat(R.from_euler('x', q[1])) @ _t_mat(trans=(-0.038, 0.0, 0.450))
-        T_arm = T_arm @ _t_mat(R.from_euler('x', -2.00719)) @ _t_mat(R.from_euler('x', q[2]))
-        T_arm = T_arm @ _t_mat(trans=(0.0005, -0.47751, -0.222701))
-        p_arm = T_arm[:3, 3]
-
-        # Forward sagittal reach (arm extends along -Y in rotating frame)
-        r = float(-p_arm[1])
-        # Elevation relative to base_link origin
-        z = float(self.BASE_PIVOT_Z + p_arm[2])
-        # Base azimuth angle is directly q[0]
-        theta = float(q[0])
-        # Gripper pitch relative to ground horizon
-        world_pitch = float(-(q[1] + q[2] - 2.00719 + q[3] + 0.4363323))
-        roll = float(q[4])
-        return r, theta, z, world_pitch, roll
 
 def main(args=None):
     rclpy.init(args=args)
@@ -1004,9 +359,15 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     finally:
+        # Publish clean stop on exit
+        try:
+            stop_msg = Int16MultiArray()
+            stop_msg.data = [0, 0, 0, 0, 0, 0]
+            node.cmd_pub.publish(stop_msg)
+        except Exception:
+            pass
         node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
