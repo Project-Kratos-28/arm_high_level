@@ -275,9 +275,9 @@ class PS5Mapper(Node):
         raw_dpad_x = msg.axes[self.DPAD_X] if len(msg.axes) > self.DPAD_X else 0.0
         speed = int(self.get_parameter('gripper_speed').value)
         if raw_dpad_x > 0.5:
-            self.gripper_cmd = speed    # D-Pad Left: Open
+            self.gripper_cmd = -1    # D-Pad Left: Open
         elif raw_dpad_x < -0.5:
-            self.gripper_cmd = -speed   # D-Pad Right: Close
+            self.gripper_cmd = 1    # D-Pad Right: Close
         else:
             self.gripper_cmd = 0
 
