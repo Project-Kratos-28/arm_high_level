@@ -5,7 +5,7 @@
 [![Version](https://img.shields.io/badge/Version-0.0.1-green.svg)](./src/arm_controller/package.xml)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![C++](https://img.shields.io/badge/C%2B%2B-17-blue.svg)](https://isocpp.org/)
-[![Project](https://img.shields.io/badge/Project-Kratos%2028-orange.svg)](https://github.com/Project-Kratos-28/arm_high_level)
+[![Project](https://img.shields.io/badge/Project-Kratos%2028-orange.svg)](https://github.com/Project-Kratos-28/)
 
 A high-performance, real-time teleoperation, inverse kinematics, and trajectory execution stack for a 5-DOF articulated robotic arm with an end-effector gripper. Designed for low latency, smooth multi-mode teleoperation (Sony PS5 DualSense and keyboard), automated collision-checked homing, and live diagnostics.
 
