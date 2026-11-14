@@ -35,13 +35,17 @@
 #define MOTOR_WRIST2_PWM_PIN     12   // PWM Pin
 #define MOTOR_WRIST2_DIR_PIN     14   // Direction Pin
 
+// Motor 6: Linear Actuator
+#define MOTOR_ACTUATOR_PWM_PIN   13   // PWM Pin
+#define MOTOR_ACTUATOR_DIR_PIN   27   // Direction Pin
+
 // ST3215 serial bus gripper via Waveshare Bus Servo Adapter (A)
 #define GRIPPER_SERVO_RX_PIN     16   // ESP32 RX is GPIO 16 (connected to Waveshare TX)
 #define GRIPPER_SERVO_TX_PIN     17   // ESP32 TX is GPIO 17 (connected to Waveshare RX)
 #define GRIPPER_SERVO_ID         1
 #define GRIPPER_SERVO_BAUD       1000000
-#define GRIPPER_RAW_OPEN         1830  // Open position (0 deg)
-#define GRIPPER_RAW_CLOSED       800   // Closed position (90 deg)
+#define GRIPPER_RAW_OPEN         2030  // Closed position (0 deg)
+#define GRIPPER_RAW_CLOSED       800   // Open position (90 deg)
 #define GRIPPER_STEP_INTERVAL_MS 40
 #define GRIPPER_MOVE_SPEED       500
 #define GRIPPER_MOVE_ACC         50
@@ -51,10 +55,11 @@
 
 // Direction polarity inversion flags
 #define INVERT_BASE_DIR          false
-#define INVERT_SHOULDER_DIR      true
-#define INVERT_ELBOW_DIR         false
+#define INVERT_SHOULDER_DIR      false
+#define INVERT_ELBOW_DIR         true
 #define INVERT_WRIST1_DIR        false
 #define INVERT_WRIST2_DIR        false
+#define INVERT_ACTUATOR_DIR      true
 
 // ============================================================================
 // PWM CONFIGURATION (ESP32 LEDC Peripheral)
@@ -62,12 +67,13 @@
 #define PWM_FREQ_HZ              20000  // 20 kHz
 #define PWM_RESOLUTION_BITS      8      // 8-bit resolution: 0 to 255
 
-// LEDC channels for the 5 motor PWM pins
+// LEDC channels for the 6 motor PWM pins
 #define CH_BASE_PWM              0
 #define CH_SHOULDER_PWM          1
 #define CH_ELBOW_PWM             2
 #define CH_WRIST1_PWM            3
 #define CH_WRIST2_PWM            4
+#define CH_ACTUATOR_PWM          5
 
 // ============================================================================
 // MICRO-ROS HANDLES & RECONNECTION STATE
@@ -90,7 +96,9 @@ std_msgs__msg__Int16MultiArray msg;
 
 // Feedback publisher echoing back actual hardware pin states:
 // [base_pwm, base_dir, shoulder_pwm, shoulder_dir, elbow_pwm, elbow_dir,
-//  wrist1_pwm, wrist1_dir, wrist2_pwm, wrist2_dir]
+//  wrist1_pwm, wrist1_dir, wrist2_pwm, wrist2_dir,
+//  gripper_cmd, gripper_target, gripper_pos, gripper_volt, gripper_tx, gripper_init,
+//  actuator_pwm, actuator_dir]
 rcl_publisher_t feedback_pub;
 std_msgs__msg__Int16MultiArray feedback_msg;
 
@@ -99,7 +107,7 @@ static int16_t msg_data_buffer[16];
 static std_msgs__msg__MultiArrayDimension dim_buffer[1];
 static char dim_label_buffer[16];
 
-static int16_t feedback_data_buffer[16];
+static int16_t feedback_data_buffer[18];
 static std_msgs__msg__MultiArrayDimension feedback_dim_buffer[1];
 static char feedback_dim_label_buffer[16];
 
@@ -249,12 +257,14 @@ void stop_all_motors() {
   ledcWrite(CH_ELBOW_PWM, 0);
   ledcWrite(CH_WRIST1_PWM, 0);
   ledcWrite(CH_WRIST2_PWM, 0);
+  ledcWrite(CH_ACTUATOR_PWM, 0);
 
   digitalWrite(MOTOR_BASE_DIR_PIN, LOW);
   digitalWrite(MOTOR_SHOULDER_DIR_PIN, LOW);
   digitalWrite(MOTOR_ELBOW_DIR_PIN, LOW);
   digitalWrite(MOTOR_WRIST1_DIR_PIN, LOW);
   digitalWrite(MOTOR_WRIST2_DIR_PIN, LOW);
+  digitalWrite(MOTOR_ACTUATOR_DIR_PIN, LOW);
 }
 
 void publish_feedback() {
@@ -264,7 +274,9 @@ void publish_feedback() {
 
   // Hardware Readback: read directly from ESP32 timer registers & pin input buffers
   // Array layout: [base_pwm, base_dir, shoulder_pwm, shoulder_dir, elbow_pwm, elbow_dir,
-  //                wrist1_pwm, wrist1_dir, wrist2_pwm, wrist2_dir]
+  //                wrist1_pwm, wrist1_dir, wrist2_pwm, wrist2_dir,
+  //                gripper_cmd, gripper_target, gripper_pos, gripper_volt, gripper_tx, gripper_init,
+  //                actuator_pwm, actuator_dir]
   feedback_data_buffer[0] = (int16_t)ledcRead(CH_BASE_PWM);
   feedback_data_buffer[1] = (int16_t)digitalRead(MOTOR_BASE_DIR_PIN);
   feedback_data_buffer[2] = (int16_t)ledcRead(CH_SHOULDER_PWM);
@@ -284,7 +296,11 @@ void publish_feedback() {
   feedback_data_buffer[14] = (int16_t)gripper_tx_packets;
   feedback_data_buffer[15] = (int16_t)(gripper_initialized ? 1 : 0);
 
-  feedback_msg.data.size = 16;
+  // Linear Actuator Live Telemetry (Indices 16..17)
+  feedback_data_buffer[16] = (int16_t)ledcRead(CH_ACTUATOR_PWM);
+  feedback_data_buffer[17] = (int16_t)digitalRead(MOTOR_ACTUATOR_DIR_PIN);
+
+  feedback_msg.data.size = 18;
   rcl_publish(&feedback_pub, &feedback_msg, NULL);
 }
 
@@ -321,8 +337,10 @@ void subscription_callback(const void * msgin)
     int32_t pitch = (array->data.size > 3) ? (int32_t)array->data.data[3] : 0;
     int32_t roll  = (array->data.size > 4) ? (int32_t)array->data.data[4] : 0;
 
-    int32_t w1 = pitch + roll;
-    int32_t w2 = pitch - roll;
+    roll = -roll;
+
+    int32_t w1 = pitch - roll;
+    int32_t w2 = pitch + roll;
 
     // Proportional normalization if combined magnitude exceeds 255
     int32_t max_mag = max(abs(w1), abs(w2));
@@ -338,6 +356,11 @@ void subscription_callback(const void * msgin)
     if (array->data.size > 5) {
       int16_t command = array->data.data[5];
       gripper_command = (command > 0) ? 1 : ((command < 0) ? -1 : 0);
+    }
+
+    // Index 6: Linear Actuator Motor (-255 to +255)
+    if (array->data.size > 6) {
+      set_motor_speed(CH_ACTUATOR_PWM, MOTOR_ACTUATOR_DIR_PIN, array->data.data[6], INVERT_ACTUATOR_DIR);
     }
 
     // Publish feedback immediately on every command tick (1:1 sync)
@@ -366,14 +389,14 @@ void init_message_memory()
   msg.layout.data_offset = 0;
 
   feedback_msg.data.data = feedback_data_buffer;
-  feedback_msg.data.size = 16;
-  feedback_msg.data.capacity = 16;
+  feedback_msg.data.size = 18;
+  feedback_msg.data.capacity = 18;
 
   feedback_dim_buffer[0].label.data = feedback_dim_label_buffer;
   feedback_dim_buffer[0].label.size = 0;
   feedback_dim_buffer[0].label.capacity = sizeof(feedback_dim_label_buffer);
-  feedback_dim_buffer[0].size = 16;
-  feedback_dim_buffer[0].stride = 16;
+  feedback_dim_buffer[0].size = 18;
+  feedback_dim_buffer[0].stride = 18;
 
   feedback_msg.layout.dim.data = feedback_dim_buffer;
   feedback_msg.layout.dim.size = 0;
@@ -465,14 +488,16 @@ void setup() {
   pinMode(MOTOR_ELBOW_DIR_PIN, OUTPUT);
   pinMode(MOTOR_WRIST1_DIR_PIN, OUTPUT);
   pinMode(MOTOR_WRIST2_DIR_PIN, OUTPUT);
+  pinMode(MOTOR_ACTUATOR_DIR_PIN, OUTPUT);
 
   digitalWrite(MOTOR_BASE_DIR_PIN, LOW);
   digitalWrite(MOTOR_SHOULDER_DIR_PIN, LOW);
   digitalWrite(MOTOR_ELBOW_DIR_PIN, LOW);
   digitalWrite(MOTOR_WRIST1_DIR_PIN, LOW);
   digitalWrite(MOTOR_WRIST2_DIR_PIN, LOW);
+  digitalWrite(MOTOR_ACTUATOR_DIR_PIN, LOW);
 
-  // Setup LEDC PWM Channels for the 5 motor PWM pins (20 kHz, 8-bit)
+  // Setup LEDC PWM Channels for the 6 motor PWM pins (20 kHz, 8-bit)
   ledcSetup(CH_BASE_PWM, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
   ledcAttachPin(MOTOR_BASE_PWM_PIN, CH_BASE_PWM);
 
@@ -487,6 +512,9 @@ void setup() {
 
   ledcSetup(CH_WRIST2_PWM, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
   ledcAttachPin(MOTOR_WRIST2_PWM_PIN, CH_WRIST2_PWM);
+
+  ledcSetup(CH_ACTUATOR_PWM, PWM_FREQ_HZ, PWM_RESOLUTION_BITS);
+  ledcAttachPin(MOTOR_ACTUATOR_PWM_PIN, CH_ACTUATOR_PWM);
 
   // ST3215 gripper is initialized on UART1 (GPIO 16 RX, GPIO 17 TX).
 

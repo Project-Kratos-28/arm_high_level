@@ -67,9 +67,10 @@ Each DC motor connects to a **Cytron MDD10A** (or similar Sign-Magnitude driver)
 | **Motor 1: Base** | `data[0]` | **GPIO 5** | **GPIO 15** | LEDC Ch 0 | Quad 3 (Free jumpers, 1/2 speed, ±125 limit) |
 | **Motor 2: Shoulder** | `data[1]` | **GPIO 0** | **GPIO 4** | LEDC Ch 1 | Quad 1 (Arm Quad cable) |
 | **Motor 3: Elbow** | `data[2]` | **GPIO 32** | **GPIO 33** | LEDC Ch 2 | Quad 1 (Arm Quad cable) |
-| **Motor 4: Wrist 1** | Combined Mixer | **GPIO 26** | **GPIO 27** | LEDC Ch 3 | Differential Bevel M1 |
-| **Motor 5: Wrist 2** | Combined Mixer | **GPIO 18** | **GPIO 19** | LEDC Ch 4 | Differential Bevel M2 (Quad 4) |
+| **Motor 4: Wrist 1** | Combined Mixer | **GPIO 26** | **GPIO 25** | LEDC Ch 3 | Differential Bevel M1 |
+| **Motor 5: Wrist 2** | Combined Mixer | **GPIO 12** | **GPIO 14** | LEDC Ch 4 | Differential Bevel M2 (Quad 4) |
 | **Actuator 6: Gripper** | `data[5]` | **GPIO 17 (TX1)** | **GPIO 16 (RX1)** | UART1 (1 Mbps) | ST3215 Serial Bus Servo (ID 1) |
+| **Motor 6: Linear Actuator** | `data[6]` | **GPIO 13** | **GPIO 27** | LEDC Ch 5 | Cytron MDD10A (D-Pad Up/Down) |
 | **Status LED** | Onboard | **GPIO 2** | — | — | Heartbeat / Connection LED |
 
 ### Critical Wiring Rules:
@@ -245,11 +246,11 @@ cd /path/to/opendayjugaad
 ```bash
 source /opt/ros/jazzy/setup.bash
 
-# Format: [Base, Shoulder, Elbow, WristPitch, WristRoll, Gripper]
-ros2 topic pub --once /arm_cmd std_msgs/msg/Int16MultiArray "{data: [200, -150, 120, 100, 0, 0]}"
+# Format: [Base, Shoulder, Elbow, WristPitch, WristRoll, Gripper, LinearActuator]
+ros2 topic pub --once /arm_cmd std_msgs/msg/Int16MultiArray "{data: [200, -150, 120, 100, 0, 0, 255]}"
 
 # Emergency Stop (all 0)
-ros2 topic pub --once /arm_cmd std_msgs/msg/Int16MultiArray "{data: [0, 0, 0, 0, 0, 0]}"
+ros2 topic pub --once /arm_cmd std_msgs/msg/Int16MultiArray "{data: [0, 0, 0, 0, 0, 0, 0]}"
 ```
 
 #### E. ST3215 Gripper Hardware Diagnostic Tool
@@ -266,8 +267,8 @@ This tool sweeps all baud rates (1M, 500k, 115.2k, etc.), scans both RX/TX pin o
 
 | Topic | Message Type | Rate | Description |
 | :--- | :--- | :---: | :--- |
-| **`/arm_cmd`** | `std_msgs/msg/Int16MultiArray` | Up to 50 Hz | **Input Commands** to ESP32: `[Base, Shoulder, Elbow, WristPitch, WristRoll, Gripper]` (values range `-255` to `+255`). |
-| **`/arm_feedback`**| `std_msgs/msg/Int16MultiArray` | 1:1 on cmd tick | **Real-Time Readback** from ESP32 timer registers: `[B_pwm, B_dir, S_pwm, S_dir, E_pwm, E_dir, W1_pwm, W1_dir, W2_pwm, W2_dir]`. Emits 1 Hz heartbeat when idle. |
+| **`/arm_cmd`** | `std_msgs/msg/Int16MultiArray` | Up to 50 Hz | **Input Commands** to ESP32: `[Base, Shoulder, Elbow, WristPitch, WristRoll, Gripper, LinearActuator]` (values range `-255` to `+255`). |
+| **`/arm_feedback`**| `std_msgs/msg/Int16MultiArray` | 1:1 on cmd tick | **Real-Time Readback** from ESP32 timer registers: `[B_pwm, B_dir, S_pwm, S_dir, E_pwm, E_dir, W1_pwm, W1_dir, W2_pwm, W2_dir, G_cmd, G_tgt, G_pos, G_volt, G_tx, G_init, Act_pwm, Act_dir]`. Emits 1 Hz heartbeat when idle. |
 
 ---
 
