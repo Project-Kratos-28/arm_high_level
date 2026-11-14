@@ -62,6 +62,7 @@ class ArmDashboardNode(Node):
         "J3: Wrist Pitch",
         "J4: Wrist Roll",
         "J5: Gripper Jaw",
+        "J6: Linear Actuator",
     ]
 
     def __init__(self):
@@ -217,10 +218,20 @@ def generate_layout(node: ArmDashboardNode) -> Layout:
 
         if val > 0:
             val_str = f"[green]{val:+4d} ({pct:+5.1f}%)[/green]"
-            pol_str = "[bold green]FORWARD[/bold green]" if i < 5 else "[bold green]OPEN[/bold green]"
+            if i == 5:
+                pol_str = "[bold green]OPEN[/bold green]"
+            elif i == 6:
+                pol_str = "[bold green]EXTEND[/bold green]"
+            else:
+                pol_str = "[bold green]FORWARD[/bold green]"
         elif val < 0:
             val_str = f"[cyan]{val:+4d} ({pct:+5.1f}%)[/cyan]"
-            pol_str = "[bold cyan]REVERSE[/bold cyan]" if i < 5 else "[bold cyan]CLOSE[/bold cyan]"
+            if i == 5:
+                pol_str = "[bold cyan]CLOSE[/bold cyan]"
+            elif i == 6:
+                pol_str = "[bold cyan]RETRACT[/bold cyan]"
+            else:
+                pol_str = "[bold cyan]REVERSE[/bold cyan]"
         else:
             val_str = "[dim]   0 (  0.0%)[/dim]"
             pol_str = "[dim]NEUTRAL[/dim]"

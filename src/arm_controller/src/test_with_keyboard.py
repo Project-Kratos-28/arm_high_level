@@ -108,6 +108,7 @@ class KeyboardTeleopNode(Node):
             self.axes[3] = 0.0
             self.axes[4] = 0.0
             self.axes[6] = 0.0
+            self.axes[7] = 0.0
             if not self.rb_active:
                 self.buttons[5] = 0
             self.is_moving = False
